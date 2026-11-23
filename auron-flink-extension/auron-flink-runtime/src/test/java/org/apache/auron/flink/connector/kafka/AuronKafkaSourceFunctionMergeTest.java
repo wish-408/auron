@@ -18,11 +18,18 @@ package org.apache.auron.flink.connector.kafka;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Field;
+import java.util.Collections;
 import java.util.Properties;
+import java.util.function.Consumer;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.auron.flink.table.function.FlinkUdfLifecycle;
 import org.apache.auron.flink.utils.SchemaConverters;
+import org.apache.auron.jni.AuronCallNativeWrapper;
 import org.apache.auron.protobuf.FFIReaderExecNode;
 import org.apache.auron.protobuf.FilterExecNode;
 import org.apache.auron.protobuf.KafkaScanExecNode;
@@ -227,5 +234,79 @@ class AuronKafkaSourceFunctionMergeTest {
         // No staged plan: the source plan passes through untouched, even with a watermark set.
         fn.setWatermarkStrategy(WatermarkStrategy.<RowData>forMonotonousTimestamps());
         assertEquals(source, fn.applyMergedCalcPlan(source));
+    }
+
+    @Test
+    void testCancelStopsUdfLifecycleAndReleasesNativeWrapperOnceWithoutDrain() throws Exception {
+        AuronKafkaSourceFunction fn = newFunction();
+        FlinkUdfLifecycle lifecycle = new FlinkUdfLifecycle();
+        lifecycle.openAndBind(Collections.emptyList(), null, null, null);
+        CountingNativeWrapper wrapper = allocateCountingNativeWrapper();
+        setUdfLifecycle(fn, lifecycle);
+        setNativeWrapper(fn, wrapper);
+
+        fn.cancel();
+
+        assertEquals(FlinkUdfLifecycle.State.STOPPING, lifecycle.getState());
+        assertEquals(0, wrapper.loadNextBatchInvocations, "cancel must not add an extra native batch drain");
+        assertEquals(1, wrapper.closeInvocations, "cancel must release the live native wrapper exactly once");
+        assertNull(readNativeWrapper(fn), "cancel must clear the wrapper so run()'s finally is idempotent");
+
+        fn.close();
+
+        assertEquals(FlinkUdfLifecycle.State.CLOSED, lifecycle.getState());
+        assertEquals(0, wrapper.loadNextBatchInvocations);
+        assertEquals(1, wrapper.closeInvocations, "close after cancel must not release the wrapper again");
+    }
+
+    private static CountingNativeWrapper allocateCountingNativeWrapper() throws Exception {
+        Field unsafeField = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+        unsafeField.setAccessible(true);
+        sun.misc.Unsafe unsafe = (sun.misc.Unsafe) unsafeField.get(null);
+        return (CountingNativeWrapper) unsafe.allocateInstance(CountingNativeWrapper.class);
+    }
+
+    private static void setNativeWrapper(AuronKafkaSourceFunction fn, AuronCallNativeWrapper wrapper) throws Exception {
+        Field field = AuronKafkaSourceFunction.class.getDeclaredField("nativeWrapper");
+        field.setAccessible(true);
+        field.set(fn, wrapper);
+    }
+
+    private static AuronCallNativeWrapper readNativeWrapper(AuronKafkaSourceFunction fn) throws Exception {
+        Field field = AuronKafkaSourceFunction.class.getDeclaredField("nativeWrapper");
+        field.setAccessible(true);
+        return (AuronCallNativeWrapper) field.get(fn);
+    }
+
+    private static void setUdfLifecycle(AuronKafkaSourceFunction fn, FlinkUdfLifecycle lifecycle) throws Exception {
+        Field field = AuronKafkaSourceFunction.class.getDeclaredField("udfLifecycle");
+        field.setAccessible(true);
+        field.set(fn, lifecycle);
+    }
+
+    /**
+     * Constructor-less test replacement for a live {@link AuronCallNativeWrapper}. The production
+     * constructor starts a native runtime, so {@link sun.misc.Unsafe#allocateInstance} creates this
+     * counter without executing any constructor or JNI code.
+     */
+    private static final class CountingNativeWrapper extends AuronCallNativeWrapper {
+        private int loadNextBatchInvocations;
+        private int closeInvocations;
+
+        @SuppressWarnings("unused")
+        private CountingNativeWrapper() {
+            super(null, null, null, 0, 0, 0, 0);
+        }
+
+        @Override
+        public boolean loadNextBatch(Consumer<VectorSchemaRoot> batchConsumer) {
+            loadNextBatchInvocations++;
+            return false;
+        }
+
+        @Override
+        public synchronized void close() {
+            closeInvocations++;
+        }
     }
 }

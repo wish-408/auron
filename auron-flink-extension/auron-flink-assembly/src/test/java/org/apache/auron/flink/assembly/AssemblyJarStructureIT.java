@@ -29,6 +29,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.jar.JarEntry;
@@ -62,6 +63,15 @@ class AssemblyJarStructureIT {
     private static final String OVERRIDE_REGISTRY_ENTRY = "META-INF/auron/shadowed-flink-execnodes.txt";
 
     private static final String STREAM_EXEC_PREFIX = "org/apache/flink/table/planner/plan/nodes/exec/stream/StreamExec";
+
+    private static final List<String> UDF_LIFECYCLE_CLASSES = Arrays.asList(
+            "org.apache.auron.functions.AuronUDFWrapperContext",
+            "org.apache.auron.flink.table.function.FlinkUdfLifecycle",
+            "org.apache.auron.flink.table.function.FlinkUdfPayload",
+            "org.apache.auron.flink.table.function.FlinkUdfToken",
+            "org.apache.auron.flink.table.function.FlinkUDFWrapperContext",
+            "org.apache.auron.flink.table.function.UdfRegistry",
+            "org.apache.auron.jni.FlinkAuronAdaptor");
 
     /**
      * Internal name of the {@code FlinkAuronExecNode} marker interface that every Auron override
@@ -116,6 +126,37 @@ class AssemblyJarStructureIT {
     }
 
     @Test
+    void udfRegistryAndWrapperClassesAreBundledExactlyOnce() throws IOException {
+        try (JarFile jar = openAssemblyJar()) {
+            for (String fqcn : UDF_LIFECYCLE_CLASSES) {
+                String entryPath = fqcn.replace('.', '/') + ".class";
+                int count = countEntries(jar, entryPath);
+                assertEquals(1, count, "Expected exactly one " + entryPath + " entry, found " + count);
+            }
+        }
+    }
+
+    @Test
+    void udfAndConnectorServiceRegistriesSurviveShade() throws IOException {
+        try (JarFile jar = openAssemblyJar()) {
+            assertServiceImplementation(
+                    jar,
+                    "META-INF/services/org.apache.flink.table.factories.Factory",
+                    "org.apache.auron.flink.connector.kafka.AuronKafkaDynamicTableFactory");
+            JarEntry legacyTableFactory =
+                    jar.getJarEntry("META-INF/services/org.apache.flink.table.factories.TableFactory");
+            assertNotNull(legacyTableFactory, "Assembly jar is missing the legacy Flink TableFactory service registry");
+            assertTrue(
+                    !readServiceImplementations(jar, legacyTableFactory).isEmpty(),
+                    "The legacy Flink TableFactory service registry must remain non-empty");
+            assertServiceImplementation(
+                    jar,
+                    "META-INF/services/org.apache.auron.jni.AuronAdaptorProvider",
+                    "org.apache.auron.jni.FlinkAuronAdaptorProvider");
+        }
+    }
+
+    @Test
     void noticeNamesAuronAndFlink() throws IOException {
         try (JarFile jar = openAssemblyJar()) {
             JarEntry notice = jar.getJarEntry("META-INF/NOTICE");
@@ -159,6 +200,31 @@ class AssemblyJarStructureIT {
             }
         }
         return count;
+    }
+
+    private static void assertServiceImplementation(JarFile jar, String servicePath, String expected)
+            throws IOException {
+        JarEntry entry = jar.getJarEntry(servicePath);
+        assertNotNull(entry, "Assembly jar is missing service registry " + servicePath);
+        List<String> implementations = readServiceImplementations(jar, entry);
+        assertTrue(
+                implementations.contains(expected),
+                "Service registry " + servicePath + " must contain the Auron implementation");
+        assertEquals(
+                1,
+                implementations.stream().filter(expected::equals).count(),
+                "Service registry " + servicePath + " must contain the Auron implementation exactly once");
+    }
+
+    private static List<String> readServiceImplementations(JarFile jar, JarEntry entry) throws IOException {
+        List<String> implementations = new ArrayList<>();
+        for (String line : new String(readEntry(jar, entry), StandardCharsets.UTF_8).split("\\R")) {
+            String trimmed = line.trim();
+            if (!trimmed.isEmpty() && !trimmed.startsWith("#")) {
+                implementations.add(trimmed);
+            }
+        }
+        return implementations;
     }
 
     private static JarFile openAssemblyJar() throws IOException {

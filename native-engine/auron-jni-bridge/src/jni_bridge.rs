@@ -443,7 +443,6 @@ pub struct JavaClasses<'a> {
 
     pub cSparkFileSegment: SparkFileSegment<'a>,
     pub cSparkSQLMetric: SparkSQLMetric<'a>,
-    pub cSparkAuronUDFWrapperContext: SparkAuronUDFWrapperContext<'a>,
     pub cSparkUDAFWrapperContext: SparkUDAFWrapperContext<'a>,
     pub cSparkUDTFWrapperContext: SparkUDTFWrapperContext<'a>,
     pub cSparkUDAFMemTracker: SparkUDAFMemTracker<'a>,
@@ -500,7 +499,6 @@ impl JavaClasses<'static> {
             let (
                 c_spark_file_segment,
                 c_spark_sql_metric,
-                c_spark_auron_udf_wrapper_context,
                 c_spark_udaf_wrapper_context,
                 c_spark_udtf_wrapper_context,
                 c_spark_udaf_mem_tracker,
@@ -514,7 +512,6 @@ impl JavaClasses<'static> {
                 "Spark" => (
                     SparkFileSegment::new(env)?,
                     SparkSQLMetric::new(env)?,
-                    SparkAuronUDFWrapperContext::new(env)?,
                     SparkUDAFWrapperContext::new(env)?,
                     SparkUDTFWrapperContext::new(env)?,
                     SparkUDAFMemTracker::new(env)?,
@@ -528,7 +525,6 @@ impl JavaClasses<'static> {
                 _ => (
                     SparkFileSegment::default(),
                     SparkSQLMetric::default(),
-                    SparkAuronUDFWrapperContext::default(),
                     SparkUDAFWrapperContext::default(),
                     SparkUDTFWrapperContext::default(),
                     SparkUDAFMemTracker::default(),
@@ -567,7 +563,6 @@ impl JavaClasses<'static> {
 
                 cSparkFileSegment: c_spark_file_segment,
                 cSparkSQLMetric: c_spark_sql_metric,
-                cSparkAuronUDFWrapperContext: c_spark_auron_udf_wrapper_context,
                 cSparkUDAFWrapperContext: c_spark_udaf_wrapper_context,
                 cSparkUDTFWrapperContext: c_spark_udtf_wrapper_context,
                 cSparkUDAFMemTracker: c_spark_udaf_mem_tracker,
@@ -1264,31 +1259,6 @@ impl<'a> AuronRssPartitionWriterBase<'_> {
             method_write_ret: ReturnType::Primitive(Primitive::Void),
             method_flush: env.get_method_id(class, "flush", "()V")?,
             method_flush_ret: ReturnType::Primitive(Primitive::Void),
-        })
-    }
-
-    fn default() -> Self {
-        unsafe { std::mem::zeroed() }
-    }
-}
-
-#[allow(non_snake_case)]
-pub struct SparkAuronUDFWrapperContext<'a> {
-    pub class: JClass<'a>,
-    pub ctor: JMethodID,
-    pub method_eval: JMethodID,
-    pub method_eval_ret: ReturnType,
-}
-impl<'a> SparkAuronUDFWrapperContext<'a> {
-    pub const SIG_TYPE: &'static str = "org/apache/auron/spark/sql/SparkAuronUDFWrapperContext";
-
-    pub fn new(env: &JNIEnv<'a>) -> JniResult<SparkAuronUDFWrapperContext<'a>> {
-        let class = get_global_jclass(env, Self::SIG_TYPE)?;
-        Ok(SparkAuronUDFWrapperContext {
-            class,
-            ctor: env.get_method_id(class, "<init>", "(Ljava/nio/ByteBuffer;)V")?,
-            method_eval: env.get_method_id(class, "eval", "(JJ)V")?,
-            method_eval_ret: ReturnType::Primitive(Primitive::Void),
         })
     }
 

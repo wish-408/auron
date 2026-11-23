@@ -279,8 +279,16 @@ public class AuronOperatorFusionProcessor implements ExecNodeGraphProcessor {
             return false;
         }
 
+        // UDF conversion is enabled for fusion: the Kafka source function owns the UDF lifecycle
+        // for the final fused plan and binds every payload to a registry token before native
+        // execution. A non-convertible UDF still falls back to the standalone native Calc path.
         final Optional<PhysicalPlanNode> plan = NativePlanFusionBuilder.buildNativeCalcPlan(
-                tableConfig, projection, condition, calcInputRowType, calcOutputRowType);
+                tableConfig,
+                projection,
+                condition,
+                calcInputRowType,
+                calcOutputRowType,
+                NativePlanFusionBuilder.UdfConversion.ENABLED);
         if (!plan.isPresent()) {
             // Not convertible to native: the standalone native Calc path handles convertibility and
             // its own Flink-codegen fallback. Nothing to stage here.

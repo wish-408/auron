@@ -21,10 +21,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import org.apache.auron.flink.table.runtime.UdfInvocationTraceFixture;
+import org.apache.auron.flink.table.runtime.UdfInvocationTraceFixture.Event;
+import org.apache.auron.flink.table.runtime.UdfInvocationTraceFixture.Phase;
 import org.apache.flink.table.api.ExplainDetail;
+import org.apache.flink.table.api.TableResult;
 import org.apache.flink.types.Row;
+import org.apache.flink.util.CloseableIterator;
 import org.apache.flink.util.CollectionUtil;
 import org.junit.jupiter.api.Test;
 
@@ -47,6 +54,24 @@ public class AuronKafkaSourceMergeITCase extends AuronKafkaSourceTestBase {
     /** Matches a job-graph operator whose type is a Calc, e.g. {@code "type" : "Calc[4]"}. */
     private static final Pattern CALC_OPERATOR = Pattern.compile("\"type\"\\s*:\\s*\"Calc\\[");
 
+    /** Primitive-argument, deterministic trace UDF matching the converter's covered call shape. */
+    public static class FusedTraceUdf extends UdfInvocationTraceFixture {
+        private static final long serialVersionUID = 1L;
+
+        FusedTraceUdf(UUID traceId, int addend) {
+            super(traceId, addend);
+        }
+
+        public int eval(int value) {
+            return super.eval(value);
+        }
+
+        @Override
+        public boolean isDeterministic() {
+            return true;
+        }
+    }
+
     /**
      * Counts the standalone {@code Calc} operators in the job graph of {@code sql}. A fused Calc is
      * absorbed into the source, so it contributes zero; an unfused Calc contributes one per operator.
@@ -59,6 +84,60 @@ public class AuronKafkaSourceMergeITCase extends AuronKafkaSourceTestBase {
             count++;
         }
         return count;
+    }
+
+    /**
+     * A Scalar UDF in a sole-consumer, no-watermark Calc fuses into the Kafka source. The source
+     * owns the UDF lifecycle, so the real JNI execution must use one function instance: one open,
+     * one eval per surviving row, and one close after the job completes.
+     */
+    @Test
+    public void testScalarUdfFusesWithSourceLifecycle() throws Exception {
+        UUID traceId = UdfInvocationTraceFixture.newTrace();
+        try {
+            environment.setParallelism(1);
+            tableEnvironment.createTemporarySystemFunction("trace_add", new FusedTraceUdf(traceId, 7));
+            String sql = "SELECT trace_add(`age`), `name` FROM T5 WHERE `age` > 20";
+
+            assertThat(calcOperatorCount(sql))
+                    .as("a UDF-bearing sole-consumer Calc must fuse into the Kafka source")
+                    .isEqualTo(0);
+
+            TableResult result = tableEnvironment.executeSql(sql);
+            List<Row> rows;
+            try (CloseableIterator<Row> iterator = result.collect()) {
+                rows = CollectionUtil.iteratorToList(iterator);
+            }
+            result.getJobClient()
+                    .orElseThrow(() -> new IllegalStateException("Missing local job client"))
+                    .getJobExecutionResult()
+                    .get();
+            rows.sort(Comparator.comparingInt(row -> (int) row.getField(0)));
+            assertThat(rows).isEqualTo(Arrays.asList(Row.of(28, "zm2"), Row.of(29, "zm1")));
+
+            List<Event> events = UdfInvocationTraceFixture.snapshot(traceId);
+            assertThat(events).isNotEmpty();
+            assertThat(events.stream()
+                            .filter(event -> event.getPhase() == Phase.OPEN)
+                            .collect(Collectors.toList()))
+                    .hasSize(1);
+            assertThat(events.stream()
+                            .filter(event -> event.getPhase() == Phase.EVAL)
+                            .map(Event::getArgument)
+                            .collect(Collectors.toList()))
+                    .containsExactlyInAnyOrder(21, 22);
+            assertThat(events.stream()
+                            .filter(event -> event.getPhase() == Phase.EVAL)
+                            .map(Event::getResult)
+                            .collect(Collectors.toList()))
+                    .containsExactlyInAnyOrder(28, 29);
+            assertThat(events.stream()
+                            .filter(event -> event.getPhase() == Phase.CLOSE)
+                            .collect(Collectors.toList()))
+                    .hasSize(1);
+        } finally {
+            UdfInvocationTraceFixture.removeTrace(traceId);
+        }
     }
 
     /**

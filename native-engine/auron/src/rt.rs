@@ -120,6 +120,7 @@ impl NativeExecutionRuntime {
         let classloader = jni_call_static!(JniBridge.getContextClassLoader() -> JObject)?;
         let classloader_global = jni_new_global_ref!(classloader.as_obj())?;
         let mut tokio_runtime_builder = tokio::runtime::Builder::new_multi_thread();
+        tokio_runtime_builder.enable_time();
         tokio_runtime_builder
             .thread_name(format!(
                 "auron-native-stage-{stage_id}-part-{partition_id}-tid-{tid}"

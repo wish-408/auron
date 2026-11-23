@@ -24,6 +24,8 @@ import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import org.apache.auron.configuration.AuronConfiguration;
 import org.apache.auron.flink.configuration.FlinkAuronConfiguration;
+import org.apache.auron.flink.table.function.FlinkUdfToken;
+import org.apache.auron.flink.table.function.UdfRegistry;
 import org.apache.auron.functions.AuronUDFWrapperContext;
 
 /**
@@ -69,9 +71,21 @@ public class FlinkAuronAdaptor extends AuronAdaptor {
         return auronFlinkConfig;
     }
 
+    /**
+     * Resolves a UDF wrapper context by the registry token carried in the plan's UDF wrapper
+     * nodes (see {@code FlinkAuronCalcOperator#bindUdfLifecycle}). The token is only valid after
+     * the owning operator opened the UDF lifecycle; decode reads an independent view of the
+     * buffer. An invalid token throws {@link IllegalArgumentException}, a well-formed but
+     * unregistered/stopped one {@link IllegalStateException} — there is deliberately no
+     * fallback to deserializing UDF payloads here, so a payload that survived unbound into
+     * native execution fails fast instead of being silently re-interpreted.
+     *
+     * @param byteBuffer the token bytes from the UDF wrapper node (position untouched)
+     * @return the registered context of the bound UDF call
+     */
     @Override
     public AuronUDFWrapperContext getAuronUDFWrapperContext(ByteBuffer byteBuffer) {
-        throw new UnsupportedOperationException();
+        return UdfRegistry.lookup(FlinkUdfToken.decode(byteBuffer));
     }
 
     @Override

@@ -27,6 +27,9 @@ import org.apache.auron.flink.arrow.FlinkArrowReader;
 import org.apache.auron.flink.arrow.FlinkArrowUtils;
 import org.apache.auron.flink.configuration.FlinkAuronConfiguration;
 import org.apache.auron.flink.metric.FlinkMetricNode;
+import org.apache.auron.flink.table.function.FlinkUdfLifecycle;
+import org.apache.auron.flink.table.function.FlinkUdfPayload;
+import org.apache.auron.flink.table.function.FlinkUdfToken;
 import org.apache.auron.jni.AuronAdaptor;
 import org.apache.auron.jni.AuronCallNativeWrapper;
 import org.apache.auron.jni.JniBridge;
@@ -39,6 +42,7 @@ import org.apache.flink.streaming.api.operators.StreamingRuntimeContext;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.functions.FunctionContext;
 import org.apache.flink.table.runtime.operators.TableStreamOperator;
 import org.apache.flink.table.types.logical.RowType;
 
@@ -76,9 +80,20 @@ import org.apache.flink.table.types.logical.RowType;
  *   <li>{@link #prepareSnapshotPreBarrier(long)} drains so buffered rows reach downstream
  *       before the checkpoint barrier crosses them. Calc is stateless; no operator-state writes
  *       are needed.
- *   <li>{@link #close()} signals end-of-input, performs a final drain, then closes the native
- *       runtime, exporter, and child allocator in nested try/finally so partial failure still
- *       releases resources. Idempotent: fields are nulled after close.
+ *   <li>{@link #finish()} owns the FINAL drain: Flink's StreamTask invokes it when input ends
+ *       normally, so buffered rows reach downstream before the operator is torn down.
+ *   <li>{@link #close()} is teardown-only — it never drains (failed or cancelled tasks must not
+ *       forward buffered rows) and is idempotent via per-field nulling. Failure order: UDF
+ *       lifecycle stop, native runtime, UDF lifecycle close, exporter, child allocator,
+ *       {@code super.close()}; every step runs, the first failure propagates, later ones join
+ *       as suppressed.
+ *   <li>UDF payloads embedded in the plan (see
+ *       {@link org.apache.auron.flink.table.function.FlinkUdfPayload}) are bound in
+ *       {@link #open()}: one {@link FlinkUdfLifecycle} owns every UDF instance of this plan, and
+ *       wrapper nodes are rewritten from serialized payloads to registry
+ *       {@link org.apache.auron.flink.table.function.FlinkUdfToken}s before the plan first
+ *       reaches native code. A native pipeline failure mid-drain stops the lifecycle first so
+ *       in-flight UDF evals fail fast instead of outliving the failing drain.
  * </ul>
  *
  * <p>Valid construction (well-formed plan tree, matching row types, non-null operator ID) is
@@ -111,9 +126,11 @@ public class FlinkAuronCalcOperator extends TableStreamOperator<RowData>
     private transient NativeRuntime nativeRuntime;
     private transient PhysicalPlanNode runtimePlan;
     private transient StreamRecord<RowData> outputRecord;
+    // Owns every UDF instance of this plan; null when the plan carries no UDF payloads.
+    private transient FlinkUdfLifecycle udfLifecycle;
     // Cached so reinitExporterAndRuntime() can reuse the value resolved once in open().
     private transient long nativeMemory;
-    // Set in close() before the final drain so drainNative() skips its post-loop reinit.
+    // Set for the final drain (finish()) so drainNative() skips its post-loop reinit.
     private transient boolean closing;
 
     /**
@@ -161,6 +178,7 @@ public class FlinkAuronCalcOperator extends TableStreamOperator<RowData>
         JniBridge.putResource(resourceId, exporter);
 
         this.runtimePlan = injectFfiReaderLeaf(plan, resourceId);
+        bindUdfLifecycle();
 
         this.nativeMemory =
                 AuronAdaptor.getInstance().getAuronConfiguration().getLong(FlinkAuronConfiguration.NATIVE_MEMORY_SIZE);
@@ -192,42 +210,86 @@ public class FlinkAuronCalcOperator extends TableStreamOperator<RowData>
         super.prepareSnapshotPreBarrier(checkpointId);
     }
 
+    /**
+     * Final drain of the operator. Flink 1.18's {@code StreamTask} invokes {@code finish()} when
+     * input ends normally (the base {@code AbstractStreamOperator} implementation is a no-op),
+     * which makes this the only correct home for the end-of-input drain: buffered rows must
+     * reach downstream before {@link #close()} tears down the native runtime. The {@code
+     * closing} flag set here suppresses {@link #drainNative()}'s post-cycle reinit so the final
+     * drain does not allocate replacement resources only to close them immediately.
+     */
+    @Override
+    public void finish() throws Exception {
+        closing = true;
+        if (exporter != null) {
+            drainNative();
+        }
+        super.finish();
+    }
+
+    /**
+     * Idempotent teardown without drain. Every step runs even when an earlier one failed; the
+     * first failure propagates and later ones join it as suppressed exceptions. Steps in order:
+     * UDF lifecycle stop (fast — in-flight evals see the stopped state), native runtime close,
+     * UDF lifecycle close (full cleanup incl. registry removal), exporter close, child allocator
+     * close, {@code super.close()}. Each resource is null-guarded so {@code close()} is safe
+     * after a partial {@link #open()} (e.g. a UDF bind failure) and after an earlier {@code
+     * close()}.
+     */
     @Override
     public void close() throws Exception {
-        // Set first so the final drainNative() below skips its post-loop reinit; otherwise
-        // we'd allocate a new wrapper + exporter root only to tear them down immediately.
-        closing = true;
+        Throwable failure = null;
         try {
-            // drainNative is responsible for constructing the native runtime on demand when
-            // the exporter has rows, so close() only needs to guard against open() failing
-            // before the exporter was created. Each resource is null-guarded individually in
-            // the nested finally below so partial-init still releases what exists.
+            stopUdfLifecycle();
+        } catch (Throwable error) {
+            failure = error;
+        }
+        try {
+            if (nativeRuntime != null) {
+                NativeRuntime runtime = nativeRuntime;
+                nativeRuntime = null;
+                runtime.close();
+            }
+        } catch (Throwable error) {
+            failure = suppress(failure, error);
+        }
+        try {
+            if (udfLifecycle != null) {
+                FlinkUdfLifecycle lifecycle = udfLifecycle;
+                udfLifecycle = null;
+                lifecycle.close();
+            }
+        } catch (Throwable error) {
+            failure = suppress(failure, error);
+        }
+        try {
             if (exporter != null) {
-                drainNative();
+                FlinkArrowFFIExporter openExporter = exporter;
+                exporter = null;
+                openExporter.close();
             }
-        } finally {
-            try {
-                if (nativeRuntime != null) {
-                    nativeRuntime.close();
-                    nativeRuntime = null;
-                }
-            } finally {
-                try {
-                    if (exporter != null) {
-                        exporter.close();
-                        exporter = null;
-                    }
-                } finally {
-                    try {
-                        if (childAllocator != null) {
-                            childAllocator.close();
-                            childAllocator = null;
-                        }
-                    } finally {
-                        super.close();
-                    }
-                }
+        } catch (Throwable error) {
+            failure = suppress(failure, error);
+        }
+        try {
+            if (childAllocator != null) {
+                BufferAllocator allocator = childAllocator;
+                childAllocator = null;
+                allocator.close();
             }
+        } catch (Throwable error) {
+            failure = suppress(failure, error);
+        }
+        try {
+            super.close();
+        } catch (Throwable error) {
+            failure = suppress(failure, error);
+        }
+        if (failure instanceof Exception) {
+            throw (Exception) failure;
+        }
+        if (failure != null) {
+            throw (Error) failure;
         }
     }
 
@@ -247,20 +309,29 @@ public class FlinkAuronCalcOperator extends TableStreamOperator<RowData>
      * {@link FlinkArrowFFIExporter#close()} on the Java exporter. Without per-cycle reinit, the
      * next {@code processElement} would either silently drop rows (the wrapper's invalid native
      * pointer fast-fails {@code loadNextBatch}) or NPE on {@code exporter.offer(row)} (writer
-     * nulled by the FFI Reader's drop). Reinit is suppressed during operator {@link #close()}
-     * via the {@link #closing} guard so the final drain does not allocate replacement resources
-     * only to tear them down.
+     * nulled by the FFI Reader's drop). Reinit is suppressed during operator {@link #finish()}
+     * and the drain it performs via the {@link #closing} guard so the final drain does not
+     * allocate replacement resources only to tear them down.
+     *
+     * <p>A pipeline failure mid-drain (e.g. a UDF eval error propagating up through JNI) first
+     * stops the UDF lifecycle so in-flight evals fail fast, then rethrows — the operator
+     * surfaces the failure and {@link #close()} completes the teardown.
      */
     private void drainNative() {
         if (exporter.isEmpty()) {
             return;
         }
-        if (nativeRuntime == null) {
-            this.nativeRuntime = nativeRuntimeFactory.create(
-                    FlinkArrowUtils.getRootAllocator(), runtimePlan, metricNode, nativeMemory);
-        }
-        while (nativeRuntime.loadNextBatch(this::emitArrowBatch)) {
-            // loop
+        try {
+            if (nativeRuntime == null) {
+                this.nativeRuntime = nativeRuntimeFactory.create(
+                        FlinkArrowUtils.getRootAllocator(), runtimePlan, metricNode, nativeMemory);
+            }
+            while (nativeRuntime.loadNextBatch(this::emitArrowBatch)) {
+                // loop
+            }
+        } catch (RuntimeException | Error e) {
+            stopUdfLifecycle();
+            throw e;
         }
         if (!closing) {
             reinitExporterAndRuntime();
@@ -278,6 +349,53 @@ public class FlinkAuronCalcOperator extends TableStreamOperator<RowData>
         exporter.reset();
         JniBridge.putResource(resourceId, exporter);
         this.nativeRuntime = null;
+    }
+
+    /**
+     * Binds every UDF payload embedded in {@link #runtimePlan}: decodes the payloads (in
+     * traversal order of {@link AuronPlanTreeRewriter#collectUdfPayloads}), opens one lifecycle
+     * owning every UDF instance of this plan, then rewrites the wrapper nodes from serialized
+     * payloads to the returned registry tokens (same traversal order, so position {@code i} of
+     * the tokens matches the wrapper at traversal position {@code i}). A plan without UDF
+     * payloads leaves this operator UDF-less — no lifecycle object, no registry entries.
+     *
+     * <p>The lifecycle field is assigned BEFORE {@link FlinkUdfLifecycle#openAndBind} so a
+     * failure inside the bind still leaves a closeable lifecycle for {@link #close()} to tear
+     * down (openAndBind also rolls back internally on failure; the field guard keeps close()
+     * safe regardless of which step threw).
+     */
+    private void bindUdfLifecycle() throws Exception {
+        List<FlinkUdfPayload> payloads = AuronPlanTreeRewriter.collectUdfPayloads(runtimePlan);
+        if (payloads.isEmpty()) {
+            return;
+        }
+        this.udfLifecycle = new FlinkUdfLifecycle();
+        List<FlinkUdfToken> tokens = udfLifecycle.openAndBind(
+                payloads,
+                new FunctionContext(getRuntimeContext()),
+                getRuntimeContext().getUserCodeClassLoader());
+        this.runtimePlan = AuronPlanTreeRewriter.rewriteUdfTokens(runtimePlan, tokens);
+    }
+
+    /** Stops the UDF lifecycle (idempotent) so in-flight and future evals fail fast. */
+    private void stopUdfLifecycle() {
+        if (udfLifecycle != null) {
+            udfLifecycle.stop();
+        }
+    }
+
+    /**
+     * Joins {@code error} onto the first {@code failure} (as suppressed when both present) so
+     * {@link #close()} can run every teardown step without masking the original exception.
+     */
+    private static Throwable suppress(Throwable failure, Throwable error) {
+        if (failure == null) {
+            return error;
+        }
+        if (failure != error) {
+            failure.addSuppressed(error);
+        }
+        return failure;
     }
 
     /**

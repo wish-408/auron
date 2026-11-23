@@ -27,6 +27,7 @@ import java.util.Map;
 import org.apache.auron.flink.runtime.operator.FlinkAuronDynamicTableSource;
 import org.apache.auron.protobuf.PhysicalPlanNode;
 import org.apache.calcite.jdbc.JavaTypeFactoryImpl;
+import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexNode;
@@ -39,7 +40,12 @@ import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.connector.source.ScanTableSource;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.functions.FunctionIdentifier;
+import org.apache.flink.table.functions.ScalarFunction;
+import org.apache.flink.table.planner.calcite.FlinkTypeFactory;
+import org.apache.flink.table.planner.calcite.FlinkTypeSystem;
 import org.apache.flink.table.planner.delegation.PlannerBase;
+import org.apache.flink.table.planner.functions.utils.ScalarSqlFunction;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecEdge;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNode;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeBase;
@@ -56,6 +62,7 @@ import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import scala.Option;
 
 /**
  * Unit tests for {@link AuronOperatorFusionProcessor}.
@@ -248,6 +255,21 @@ class AuronOperatorFusionProcessorTest {
         assertFalse(source.isMergedCalcPlanSet());
     }
 
+    /** Contract: the Kafka source owns the UDF lifecycle on the fused path, so a convertible
+     * UDF-bearing Calc stages onto the source with its payload embedded in the fused physical
+     * plan. The source rewrites that payload to a registry token before starting native execution. */
+    @Test
+    void testUdfBearingCalcStaged() {
+        FakeAuronSource source = new FakeAuronSource(false);
+        RexNode udfCall = udfCall(TYPE_FACTORY.createSqlType(SqlTypeName.INTEGER), new AddOneUdf(), intRef(0));
+
+        boolean staged =
+                stage(source, TWO_INT_INPUT, RowType.of(new IntType()), Collections.singletonList(udfCall), null);
+
+        assertTrue(staged, "A UDF-bearing Calc must fuse; the Kafka source owns its lifecycle");
+        assertTrue(source.isMergedCalcPlanSet());
+    }
+
     /** Contract: a projection OUTPUT field named like a reserved Kafka metadata column blocks fusion
      * (the native engine resolves by name and would silently bind to the metadata column). */
     @Test
@@ -295,6 +317,27 @@ class AuronOperatorFusionProcessorTest {
 
     private static RexNode intRef(int idx) {
         return REX_BUILDER.makeInputRef(TYPE_FACTORY.createSqlType(SqlTypeName.INTEGER), idx);
+    }
+
+    private static final FlinkTypeFactory FLINK_TYPE_FACTORY =
+            new FlinkTypeFactory(AuronOperatorFusionProcessorTest.class.getClassLoader(), FlinkTypeSystem.INSTANCE);
+
+    /** A minimal UDF; its body is irrelevant because the fusion pass rejects the call before
+     * converting it. */
+    public static class AddOneUdf extends ScalarFunction {
+        private static final long serialVersionUID = 1L;
+
+        public int eval(int value) {
+            return value + 1;
+        }
+    }
+
+    /** Builds a call to a user-defined {@link ScalarFunction} in the planner's ScalarSqlFunction
+     * wrapper — the shape {@code registerFunction} produces. */
+    private static RexNode udfCall(RelDataType returnType, ScalarFunction function, RexNode... operands) {
+        ScalarSqlFunction sqlFunction = new ScalarSqlFunction(
+                FunctionIdentifier.of("test_udf"), "test_udf", function, FLINK_TYPE_FACTORY, Option.empty());
+        return REX_BUILDER.makeCall(returnType, sqlFunction, Arrays.asList(operands));
     }
 
     private StreamExecCalc newCalc(List<RexNode> projection, RexNode condition, RowType outputType) {

@@ -276,7 +276,16 @@ public class StreamExecCalc extends CommonExecCalc
      */
     private Optional<PhysicalPlanNode> tryBuildAuronPlan(
             ExecNodeConfig config, RowType inputRowType, RowType outputRowType) {
-        return NativePlanFusionBuilder.buildNativeCalcPlan(config, projection, condition, inputRowType, outputRowType);
+        // UDF conversion is enabled because this node runs the converted plan through
+        // FlinkAuronCalcOperator, which opens the UDF lifecycle and binds wrapper payloads to
+        // registry tokens at operator open().
+        return NativePlanFusionBuilder.buildNativeCalcPlan(
+                config,
+                projection,
+                condition,
+                inputRowType,
+                outputRowType,
+                NativePlanFusionBuilder.UdfConversion.ENABLED);
     }
 
     /**

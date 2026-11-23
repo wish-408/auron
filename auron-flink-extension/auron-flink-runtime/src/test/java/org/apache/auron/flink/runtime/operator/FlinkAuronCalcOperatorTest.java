@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
+import com.google.protobuf.ByteString;
 import java.io.File;
 import java.lang.reflect.Field;
 import java.util.ArrayDeque;
@@ -38,11 +39,14 @@ import java.util.regex.Pattern;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.auron.flink.arrow.FlinkArrowFFIExporter;
+import org.apache.auron.flink.table.function.FlinkUdfPayload;
 import org.apache.auron.jni.JniBridge;
 import org.apache.auron.protobuf.FFIReaderExecNode;
 import org.apache.auron.protobuf.FilterExecNode;
 import org.apache.auron.protobuf.LimitExecNode;
+import org.apache.auron.protobuf.PhysicalExprNode;
 import org.apache.auron.protobuf.PhysicalPlanNode;
+import org.apache.auron.protobuf.PhysicalSparkUDFWrapperExprNode;
 import org.apache.auron.protobuf.ProjectionExecNode;
 import org.apache.auron.protobuf.Schema;
 import org.apache.flink.api.common.operators.ProcessingTimeService.ProcessingTimeCallback;
@@ -94,8 +98,12 @@ import org.junit.jupiter.api.Test;
  *   <li>{@code processWatermark} must drain BEFORE forwarding the watermark downstream.
  *   <li>{@code prepareSnapshotPreBarrier} must drain in-flight rows (Calc is stateless, but
  *       buffered rows must reach downstream before the checkpoint barrier).
- *   <li>{@code close()} must flush residue rows, then close native runtime, exporter, and
- *       allocator in order; idempotent.
+ *   <li>{@code finish()} must drain buffered rows (Flink invokes it on normal input end) and
+ *       {@code close()} must be teardown-only: a close without a preceding finish drains
+ *       nothing, closes every allocated resource in order, and is idempotent.
+ *   <li>A UDF payload embedded in the plan must fail {@code open()} fast (invalid bytes) and
+ *       a failure during the UDF bind must still leave a {@code close()} that releases every
+ *       resource without throwing.
  *   <li>{@link SupportsAuronNative#getPhysicalPlanNodes()} must return the constructor-passed
  *       plan as the sole element.
  *   <li>{@link SupportsAuronNative#getAuronOperatorId()} must return the unsuffixed value
@@ -385,7 +393,7 @@ public class FlinkAuronCalcOperatorTest {
      * throw and must not double-close.
      */
     @Test
-    public void testCloseDrainsResidueAndIsIdempotent() throws Exception {
+    public void testCloseIsTeardownOnlyAndIdempotent() throws Exception {
         FakeExporterTrackingOperator op = newTrackingOperator(/* fullAfterRows */ 999);
         op.open();
         for (int i = 0; i < 3; i++) {
@@ -394,13 +402,100 @@ public class FlinkAuronCalcOperatorTest {
 
         op.close();
 
+        // Teardown-only: buffered rows are NOT drained here (finish() owns the final drain),
+        // and without a drain no native runtime was ever constructed.
+        assertEquals(0, op.fakeRuntime.loadNextBatchInvocations, "close() must not drain buffered rows");
+        assertEquals(
+                0, op.fakeRuntime.closeInvocations, "close() must not construct/close a native runtime it never built");
         assertTrue(op.tracker.closeCount >= 1, "close() must close the exporter");
-        assertEquals(1, op.fakeRuntime.closeInvocations, "close() must close native runtime");
         assertEquals(0L, op.openedChildAllocator.getAllocatedMemory(), "Child allocator must be drained after close");
 
         // Second close: must not throw or double-close.
         op.close();
-        assertEquals(1, op.fakeRuntime.closeInvocations, "Second close() must not re-close native runtime");
+        assertEquals(1, op.tracker.closeCount, "Second close() must not re-close the exporter");
+        assertEquals(0, op.fakeRuntime.closeInvocations, "Second close() must stay teardown-free");
+    }
+
+    /**
+     * Contract: {@code finish()} is the home of the final drain (Flink's StreamTask invokes it
+     * when input ends normally). Residue rows are pushed through the native pipeline there —
+     * the {@code closing} flag suppresses the post-drain reinit — and the runtime the drain
+     * constructed is released by the subsequent {@code close()}.
+     */
+    @Test
+    public void testFinishDrainsResidueThenCloseReleases() throws Exception {
+        FakeExporterTrackingOperator op = newTrackingOperator(/* fullAfterRows */ 999);
+        op.open();
+        for (int i = 0; i < 3; i++) {
+            op.processElement(new StreamRecord<>(GenericRowData.of(i)));
+        }
+
+        op.finish();
+
+        assertEquals(1, op.fakeRuntime.loadNextBatchInvocations, "finish() must drain the buffered rows");
+
+        op.close();
+
+        assertEquals(1, op.fakeRuntime.closeInvocations, "close() must close the runtime the final drain left behind");
+        assertTrue(op.tracker.closeCount >= 1, "close() must close the exporter");
+        assertEquals(0L, op.openedChildAllocator.getAllocatedMemory(), "Child allocator must be drained after close");
+    }
+
+    /**
+     * Contract: {@code finish()} on an empty exporter is a no-op — the same short-circuit as a
+     * no-op watermark/checkpoint drain keeps the wrapper alive across.
+     */
+    @Test
+    public void testFinishOnEmptyExporterSkipsDrain() throws Exception {
+        FakeExporterTrackingOperator op = newTrackingOperator(/* fullAfterRows */ 999);
+        op.open();
+
+        op.finish();
+
+        assertEquals(0, op.fakeRuntime.loadNextBatchInvocations, "finish() on an empty exporter must not drain");
+        op.close();
+        assertEquals(0, op.fakeRuntime.closeInvocations, "no runtime was constructed, so none is closed");
+    }
+
+    /**
+     * Contract: a UDF wrapper whose serialized bytes are not a valid {@link FlinkUdfPayload}
+     * must fail {@code open()} fast (the payload must never reach native execution unbound), and
+     * the partially-opened operator (exporter, allocator) must still close cleanly.
+     */
+    @Test
+    public void testOpenFailsFastOnGarbageUdfPayloadAndCloseStillReleases() throws Exception {
+        PhysicalPlanNode plan =
+                buildProjectFilterFfiReaderPlanWithUdfExpr(ByteString.copyFrom(new byte[] {9, 9, 9, 9, 9}));
+        RowType rowType = RowType.of(new LogicalType[] {new IntType()}, new String[] {"id"});
+        TestFlinkAuronCalcOperator op = new TestFlinkAuronCalcOperator(
+                plan, rowType, rowType, "auron-op-id", (a, p, m, mem) -> new FakeNativeRuntime());
+
+        assertThrows(IllegalArgumentException.class, () -> op.open());
+
+        // The exporter and child allocator were created before the UDF bind: close() must
+        // release them without throwing despite the failed open().
+        op.close();
+    }
+
+    /**
+     * Contract: a payload that decodes but whose call descriptor is not a serialization stream
+     * fails the bind inside {@code openAndBind} (which rolls back its own registrations); the
+     * lifecycle field was assigned before the bind, so {@code close()} must still tear the
+     * operator down without throwing.
+     */
+    @Test
+    public void testOpenFailureDuringUdfBindStillClosesLifecycle() throws Exception {
+        byte[] payload = new FlinkUdfPayload("calc:bind", 0, "T", new byte[] {1, 2, 3}).encode();
+        PhysicalPlanNode plan = buildProjectFilterFfiReaderPlanWithUdfExpr(ByteString.copyFrom(payload));
+        RowType rowType = RowType.of(new LogicalType[] {new IntType()}, new String[] {"id"});
+        UdfBindingTestOperator op = new UdfBindingTestOperator(
+                plan, rowType, rowType, "auron-op-id", (a, p, m, mem) -> new FakeNativeRuntime());
+
+        // The stub context exposes a real user code classloader so the bind run reaches the
+        // descriptor deserialization instead of failing on a null classloader.
+        assertThrows(java.io.IOException.class, () -> op.open());
+
+        op.close();
     }
 
     // ---------------------------------------------------------------------
@@ -611,6 +706,37 @@ public class FlinkAuronCalcOperatorTest {
                 .build();
     }
 
+    /**
+     * Builds Project[Filter[FFIReader-placeholder]] whose filter expression is a single UDF
+     * wrapper node carrying the given {@code serialized} bytes — the shape a UDF-enabled Calc
+     * plan has before the operator rewrites the payload into a registry token.
+     */
+    private static PhysicalPlanNode buildProjectFilterFfiReaderPlanWithUdfExpr(ByteString serialized) {
+        Schema emptySchema = Schema.newBuilder().build();
+        PhysicalPlanNode leaf = PhysicalPlanNode.newBuilder()
+                .setFfiReader(FFIReaderExecNode.newBuilder()
+                        .setNumPartitions(1)
+                        .setSchema(emptySchema)
+                        .setExportIterProviderResourceId("placeholder")
+                        .build())
+                .build();
+        PhysicalExprNode wrapper = PhysicalExprNode.newBuilder()
+                .setSparkUdfWrapperExpr(PhysicalSparkUDFWrapperExprNode.newBuilder()
+                        .setSerialized(serialized)
+                        .setReturnNullable(false)
+                        .build())
+                .build();
+        PhysicalPlanNode filter = PhysicalPlanNode.newBuilder()
+                .setFilter(FilterExecNode.newBuilder()
+                        .setInput(leaf)
+                        .addExpr(wrapper)
+                        .build())
+                .build();
+        return PhysicalPlanNode.newBuilder()
+                .setProjection(ProjectionExecNode.newBuilder().setInput(filter).build())
+                .build();
+    }
+
     private static FFIReaderExecNode descendToFfiReader(PhysicalPlanNode node) {
         if (node.hasFfiReader()) {
             return node.getFfiReader();
@@ -709,6 +835,28 @@ public class FlinkAuronCalcOperatorTest {
             Field f = FlinkAuronCalcOperator.class.getDeclaredField("childAllocator");
             f.setAccessible(true);
             return (BufferAllocator) f.get(this);
+        }
+    }
+
+    /**
+     * Variant whose runtime context exposes a user code classloader, for tests whose
+     * {@code open()} reaches the UDF bind (the default stub leaves it unset, which would fail
+     * the bind on the classloader before the step under test).
+     */
+    static class UdfBindingTestOperator extends TestFlinkAuronCalcOperator {
+
+        UdfBindingTestOperator(
+                PhysicalPlanNode plan,
+                RowType inputRowType,
+                RowType outputRowType,
+                String auronOperatorId,
+                NativeRuntimeFactory factory) {
+            super(plan, inputRowType, outputRowType, auronOperatorId, factory);
+        }
+
+        @Override
+        public StreamingRuntimeContext getRuntimeContext() {
+            return makeUdfStubRuntimeContext();
         }
     }
 
@@ -1049,6 +1197,23 @@ public class FlinkAuronCalcOperatorTest {
         @Override
         public int getIndexOfThisSubtask() {
             return SUBTASK_INDEX;
+        }
+    }
+
+    /** Stub variant that also exposes a user code classloader for UDF-binding tests. */
+    static class UdfStubStreamingRuntimeContext extends StubStreamingRuntimeContext {
+
+        @Override
+        public ClassLoader getUserCodeClassLoader() {
+            return FlinkAuronCalcOperatorTest.class.getClassLoader();
+        }
+    }
+
+    private static StreamingRuntimeContext makeUdfStubRuntimeContext() {
+        try {
+            return (StreamingRuntimeContext) unsafe().allocateInstance(UdfStubStreamingRuntimeContext.class);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         }
     }
 

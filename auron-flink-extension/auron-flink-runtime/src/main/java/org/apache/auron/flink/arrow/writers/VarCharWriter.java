@@ -16,10 +16,13 @@
  */
 package org.apache.auron.flink.arrow.writers;
 
+import java.nio.ByteBuffer;
 import org.apache.arrow.vector.VarCharVector;
+import org.apache.flink.core.memory.MemorySegment;
 import org.apache.flink.table.data.ArrayData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
+import org.apache.flink.table.data.binary.BinaryStringData;
 
 /**
  * {@link ArrowFieldWriter} for variable-length strings ({@link VarCharVector}).
@@ -55,8 +58,40 @@ public abstract class VarCharWriter<T> extends ArrowFieldWriter<T> {
         if (isNullAt(in, ordinal)) {
             vector.setNull(getCount());
         } else {
-            byte[] bytes = readString(in, ordinal).toBytes();
-            vector.setSafe(getCount(), bytes);
+            writeString(vector, readString(in, ordinal));
+        }
+    }
+
+    private void writeString(VarCharVector vector, StringData value) {
+        if (value instanceof BinaryStringData) {
+            BinaryStringData binary = (BinaryStringData) value;
+            binary.ensureMaterialized();
+            MemorySegment[] segments = binary.getSegments();
+            if (segments != null
+                    && segments.length == 1
+                    && binary.getOffset() >= 0
+                    && binary.getSizeInBytes() >= 0
+                    && binary.getOffset() + binary.getSizeInBytes() <= segments[0].size()) {
+                ByteBuffer buffer = segmentBuffer(segments[0]);
+                if (buffer != null) {
+                    vector.setSafe(getCount(), buffer, binary.getOffset(), binary.getSizeInBytes());
+                    return;
+                }
+            }
+        }
+        byte[] bytes = value.toBytes();
+        vector.setSafe(getCount(), bytes);
+    }
+
+    private static ByteBuffer segmentBuffer(MemorySegment segment) {
+        if (segment.isOffHeap()) {
+            ByteBuffer buffer = segment.getOffHeapBuffer();
+            return buffer == null ? null : buffer.duplicate();
+        }
+        try {
+            return segment.wrap(0, segment.size());
+        } catch (UnsupportedOperationException ignored) {
+            return null;
         }
     }
 

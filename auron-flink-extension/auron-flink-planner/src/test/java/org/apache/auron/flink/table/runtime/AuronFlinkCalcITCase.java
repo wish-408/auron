@@ -23,9 +23,16 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.UUID;
+import java.util.stream.Collectors;
 import org.apache.auron.flink.table.AuronFlinkTableTestBase;
 import org.apache.auron.flink.table.planner.UnsupportedFlinkNodeRecorder;
+import org.apache.auron.flink.table.runtime.UdfInvocationTraceFixture.Event;
+import org.apache.auron.flink.table.runtime.UdfInvocationTraceFixture.Phase;
+import org.apache.flink.table.api.TableResult;
+import org.apache.flink.table.planner.factories.TestValuesTableFactory;
 import org.apache.flink.types.Row;
+import org.apache.flink.util.CloseableIterator;
 import org.apache.flink.util.CollectionUtil;
 import org.junit.jupiter.api.Test;
 
@@ -33,6 +40,204 @@ import org.junit.jupiter.api.Test;
  * IT case for Flink Calc Operator on Auron.
  */
 public class AuronFlinkCalcITCase extends AuronFlinkTableTestBase {
+
+    @Test
+    public void testStageZeroSupportedPlusRunsNatively() throws Exception {
+        UnsupportedFlinkNodeRecorder.resetForTest();
+        TableResult result = tableEnvironment.executeSql("select `int` + 1 from T1");
+        List<Row> rows;
+        try (CloseableIterator<Row> iterator = result.collect()) {
+            rows = CollectionUtil.iteratorToList(iterator);
+        }
+        assertThat(rows).containsExactlyInAnyOrder(Row.of(2), Row.of(3), Row.of(3));
+        assertThat(UnsupportedFlinkNodeRecorder.peekEmitCount()).isZero();
+    }
+
+    @Test
+    public void testScalarUdfRunsNativelyWithRealLifecycleTrace() throws Exception {
+        UUID traceId = UdfInvocationTraceFixture.newTrace();
+        try {
+            environment.setParallelism(1);
+            tableEnvironment.createTemporarySystemFunction("trace_add", new UdfInvocationTraceFixture(traceId, 7));
+            UnsupportedFlinkNodeRecorder.resetForTest();
+            TableResult result = tableEnvironment.executeSql("select trace_add(`int`), `int` + 1 from T1");
+            List<Row> rows;
+            try (CloseableIterator<Row> iterator = result.collect()) {
+                rows = CollectionUtil.iteratorToList(iterator);
+                result.getJobClient()
+                        .orElseThrow(() -> new IllegalStateException("缺少本地作业客户端"))
+                        .getJobExecutionResult()
+                        .get();
+            }
+            assertThat(rows).containsExactlyInAnyOrder(Row.of(8, 2), Row.of(9, 3), Row.of(9, 3));
+            assertThat(UnsupportedFlinkNodeRecorder.peekEmitCount()).isZero();
+
+            List<Event> events = UdfInvocationTraceFixture.snapshot(traceId);
+            assertThat(events).as("本地真实执行必须共享静态 trace，不能用手工生命周期代替").isNotEmpty();
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.OPEN))
+                    .isNotEmpty()
+                    .allSatisfy(event -> assertThat(event.getSharedTraceClass()).isTrue());
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.EVAL))
+                    .extracting(Event::getArgument)
+                    .containsExactlyInAnyOrder(1, 2, 2);
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.EVAL))
+                    .extracting(Event::getResult)
+                    .containsExactlyInAnyOrder(8, 9, 9);
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.EVAL))
+                    .allSatisfy(event -> {
+                        assertThat(event.getArgumentType()).isEqualTo(Integer.class);
+                        assertThat(event.getResult()).isEqualTo((Integer) event.getArgument() + 7);
+                    });
+            assertThat(events.stream()
+                            .collect(Collectors.groupingBy(Event::getRunId))
+                            .values())
+                    .allSatisfy(run -> {
+                        assertThat(run.get(0).getPhase()).isEqualTo(Phase.OPEN);
+                        assertThat(run.get(run.size() - 1).getPhase()).isEqualTo(Phase.CLOSE);
+                        assertThat(run.subList(1, run.size() - 1)).allSatisfy(event -> assertThat(event.getPhase())
+                                .isEqualTo(Phase.EVAL));
+                        assertThat(run.stream()
+                                        .filter(event -> event.getPhase() == Phase.EVAL)
+                                        .map(Event::getThreadId)
+                                        .distinct()
+                                        .count())
+                                .isLessThanOrEqualTo(1);
+                        assertThat(run).allSatisfy(event -> assertThat(event.getThreadId())
+                                .isPositive());
+                        for (int i = 0; i < run.size(); i++) {
+                            assertThat(run.get(i).getInvocationSequence()).isEqualTo(i + 1L);
+                        }
+                    });
+        } finally {
+            UdfInvocationTraceFixture.removeTrace(traceId);
+        }
+    }
+
+    /** A UDF wrapped by an unsupported outer expression falls back to Flink codegen. The fallback
+     * must preserve both the UDF lifecycle and the unsupported expression's result. */
+    @Test
+    public void testScalarUdfFallsBackWhenOuterExpressionIsUnsupported() throws Exception {
+        UUID traceId = UdfInvocationTraceFixture.newTrace();
+        try {
+            environment.setParallelism(1);
+            tableEnvironment.createTemporarySystemFunction("trace_add", new UdfInvocationTraceFixture(traceId, 7));
+            UnsupportedFlinkNodeRecorder.resetForTest();
+
+            List<Row> rows = CollectionUtil.iteratorToList(tableEnvironment
+                    .executeSql("select UPPER(trace_add(`string`)) from T1")
+                    .collect());
+
+            assertThat(UnsupportedFlinkNodeRecorder.peekEmitCount())
+                    .as("an unsupported outer expression must take the whole Calc to Flink fallback")
+                    .isPositive();
+            rows.sort(Comparator.comparing(o -> (String) o.getField(0)));
+            assertThat(rows).isEqualTo(Arrays.asList(Row.of("COMMENT#1:7"), Row.of("COMMENT#1:7"), Row.of("HI:7")));
+
+            List<Event> events = UdfInvocationTraceFixture.snapshot(traceId);
+            assertThat(events).isNotEmpty();
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.OPEN))
+                    .hasSize(1);
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.EVAL))
+                    .extracting(Event::getArgumentType)
+                    .containsOnly(String.class);
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.EVAL))
+                    .extracting(Event::getArgument)
+                    .containsExactlyInAnyOrder("Hi", "Comment#1", "Comment#1");
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.EVAL))
+                    .extracting(Event::getResult)
+                    .containsExactlyInAnyOrder("Hi:7", "Comment#1:7", "Comment#1:7");
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.CLOSE))
+                    .hasSize(1);
+        } finally {
+            UdfInvocationTraceFixture.removeTrace(traceId);
+        }
+    }
+
+    /** A convertible UDF in the same projection as an unsupported expression must not create a
+     * half-native plan. The whole Calc falls back, and both columns keep Flink semantics. */
+    @Test
+    public void testScalarUdfWithUnsupportedExpressionInSameProjectionFallsBack() throws Exception {
+        UUID traceId = UdfInvocationTraceFixture.newTrace();
+        try {
+            environment.setParallelism(1);
+            tableEnvironment.createTemporarySystemFunction("trace_add", new UdfInvocationTraceFixture(traceId, 7));
+            UnsupportedFlinkNodeRecorder.resetForTest();
+
+            List<Row> rows = CollectionUtil.iteratorToList(tableEnvironment
+                    .executeSql("select trace_add(`string`), CHAR_LENGTH(`string`) from T1")
+                    .collect());
+
+            assertThat(UnsupportedFlinkNodeRecorder.peekEmitCount())
+                    .as("an unsupported sibling expression must take the whole Calc to Flink fallback")
+                    .isPositive();
+            rows.sort(Comparator.comparing(o -> (String) o.getField(0)));
+            assertThat(rows)
+                    .isEqualTo(Arrays.asList(Row.of("Comment#1:7", 9), Row.of("Comment#1:7", 9), Row.of("Hi:7", 2)));
+
+            List<Event> events = UdfInvocationTraceFixture.snapshot(traceId);
+            assertThat(events).isNotEmpty();
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.OPEN))
+                    .hasSize(1);
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.EVAL))
+                    .extracting(Event::getArgument)
+                    .containsExactlyInAnyOrder("Hi", "Comment#1", "Comment#1");
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.EVAL))
+                    .extracting(Event::getResult)
+                    .containsExactlyInAnyOrder("Hi:7", "Comment#1:7", "Comment#1:7");
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.CLOSE))
+                    .hasSize(1);
+        } finally {
+            UdfInvocationTraceFixture.removeTrace(traceId);
+        }
+    }
+
+    /** A STRING UDF over a nullable column runs natively and preserves NULL propagation end to
+     * end. This complements the Arrow-FFI unit tests with the SQL planner and MiniCluster path. */
+    @Test
+    public void testNullableStringUdfRunsNativelyWithNullPropagation() throws Exception {
+        UUID traceId = UdfInvocationTraceFixture.newTrace();
+        try {
+            environment.setParallelism(1);
+            String dataId =
+                    TestValuesTableFactory.registerData(Arrays.asList(row("Hi"), row((String) null), row("Comment#1")));
+            tableEnvironment.executeSql(" CREATE TABLE T_STRING_NULL ( "
+                    + "`string` STRING "
+                    + ") WITH ( "
+                    + "'connector' = 'values',"
+                    + "'data-id' = '" + dataId + "',"
+                    + "'failing-source' = 'false' "
+                    + ")");
+            tableEnvironment.createTemporarySystemFunction("trace_add", new UdfInvocationTraceFixture(traceId, 7));
+            UnsupportedFlinkNodeRecorder.resetForTest();
+
+            List<Row> rows = CollectionUtil.iteratorToList(tableEnvironment
+                    .executeSql("select trace_add(`string`) from T_STRING_NULL")
+                    .collect());
+
+            assertThat(UnsupportedFlinkNodeRecorder.peekEmitCount())
+                    .as("a primitive nullable STRING UDF call must run natively")
+                    .isZero();
+            assertThat(rows).containsExactlyInAnyOrder(Row.of("Hi:7"), Row.of((Object) null), Row.of("Comment#1:7"));
+
+            List<Event> events = UdfInvocationTraceFixture.snapshot(traceId);
+            assertThat(events).isNotEmpty();
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.OPEN))
+                    .hasSize(1);
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.EVAL))
+                    .extracting(Event::getArgumentType)
+                    .containsOnly(String.class);
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.EVAL))
+                    .extracting(Event::getArgument)
+                    .containsExactlyInAnyOrder("Hi", null, "Comment#1");
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.EVAL))
+                    .extracting(Event::getResult)
+                    .containsExactlyInAnyOrder("Hi:7", null, "Comment#1:7");
+            assertThat(events.stream().filter(event -> event.getPhase() == Phase.CLOSE))
+                    .hasSize(1);
+        } finally {
+            UdfInvocationTraceFixture.removeTrace(traceId);
+        }
+    }
 
     @Test
     public void testPlus() {

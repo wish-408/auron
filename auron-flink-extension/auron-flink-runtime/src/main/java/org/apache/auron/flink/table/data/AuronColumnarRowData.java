@@ -18,6 +18,9 @@ package org.apache.auron.flink.table.data;
 
 import static org.apache.flink.util.Preconditions.checkArgument;
 
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.reflect.Constructor;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.table.data.*;
 import org.apache.flink.table.data.binary.TypedSetters;
@@ -35,6 +38,19 @@ public class AuronColumnarRowData implements RowData, TypedSetters {
     private VectorizedColumnBatch vectorizedColumnBatch;
     private int rowId;
     private int dataColStartIndex = 0;
+
+    private static final MethodHandle INTERNAL_STRING_CONSTRUCTOR = internalStringConstructor();
+
+    /** 获取 Java 11 的包私有 String(byte[], byte) 构造器 */
+    private static MethodHandle internalStringConstructor() {
+        try {
+            Constructor<String> constructor = String.class.getDeclaredConstructor(byte[].class, byte.class);
+            constructor.setAccessible(true);
+            return MethodHandles.lookup().unreflectConstructor(constructor);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Failed to access String internal constructor", e);
+        }
+    }
 
     public AuronColumnarRowData() {
         this.rowKind = RowKind.INSERT;
@@ -113,9 +129,23 @@ public class AuronColumnarRowData implements RowData, TypedSetters {
     }
 
     public StringData getString(int pos) {
+        // 把(rowId, pos)的数据从native memory拷贝到堆上的byte
+        // 注意，需要rust侧保证写入native memory的字符串已经是java的LATIN1编码
         BytesColumnVector.Bytes byteArray =
                 this.vectorizedColumnBatch.getByteArray(this.rowId, pos + dataColStartIndex);
-        return StringData.fromBytes(byteArray.data, byteArray.offset, byteArray.len);
+        try {
+            // 零拷贝构造String对象，直接把byteArray的data传给String
+            String value = (String) INTERNAL_STRING_CONSTRUCTOR.invokeExact(byteArray.data, (byte) 0);
+            return StringData.fromString(value);
+        } catch (Throwable ignoredException) {
+            String value = new String(byteArray.data);
+            return StringData.fromString(value);
+        }
+        // String value = new String(byteArray.data); // 会多一次从byteArray.data到String内部缓冲区的拷贝
+        // return StringData.fromString(value);
+        // [wsh_dev] 此处可通过 (byteArray.data, byteArray.offset, byteArray.len)构建一个String对象，返回缓存了String对象的StringData
+        // 后续调用udf时会把StringData变成String，缓存了之后可以直接返回String而不用再构建新的String
+        // return StringData.fromBytes(byteArray.data, byteArray.offset, byteArray.len);
     }
 
     public DecimalData getDecimal(int pos, int precision, int scale) {

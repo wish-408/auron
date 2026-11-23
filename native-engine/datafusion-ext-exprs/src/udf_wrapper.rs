@@ -43,7 +43,7 @@ use datafusion_ext_commons::{
 use jni::objects::GlobalRef;
 use once_cell::sync::OnceCell;
 
-pub struct SparkUDFWrapperExpr {
+pub struct UDFWrapperExpr {
     pub serialized: Vec<u8>,
     pub return_type: DataType,
     pub return_nullable: bool,
@@ -54,7 +54,7 @@ pub struct SparkUDFWrapperExpr {
     expr_string: String,
 }
 
-impl PartialEq for SparkUDFWrapperExpr {
+impl PartialEq for UDFWrapperExpr {
     fn eq(&self, other: &Self) -> bool {
         physical_exprs_bag_equal(&self.params, &other.params)
             && self.serialized == other.serialized
@@ -63,9 +63,9 @@ impl PartialEq for SparkUDFWrapperExpr {
     }
 }
 
-impl Eq for SparkUDFWrapperExpr {}
+impl Eq for UDFWrapperExpr {}
 
-impl SparkUDFWrapperExpr {
+impl UDFWrapperExpr {
     pub fn try_new(
         serialized: Vec<u8>,
         return_type: DataType,
@@ -97,25 +97,25 @@ impl SparkUDFWrapperExpr {
     }
 }
 
-impl Display for SparkUDFWrapperExpr {
+impl Display for UDFWrapperExpr {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(self, f)
     }
 }
 
-impl Debug for SparkUDFWrapperExpr {
+impl Debug for UDFWrapperExpr {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "UDFWrapper({})", self.expr_string)
     }
 }
 
-impl Hash for SparkUDFWrapperExpr {
+impl Hash for UDFWrapperExpr {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.serialized.hash(state);
     }
 }
 
-impl PhysicalExpr for SparkUDFWrapperExpr {
+impl PhysicalExpr for UDFWrapperExpr {
     fn data_type(&self, _input_schema: &Schema) -> Result<DataType> {
         Ok(self.return_type.clone())
     }
@@ -126,7 +126,7 @@ impl PhysicalExpr for SparkUDFWrapperExpr {
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
         if !is_task_running() {
-            df_execution_err!("SparkUDFWrapper: is_task_running=false")?;
+            df_execution_err!("UDFWrapper: is_task_running=false")?;
         }
 
         let batch_schema = batch.schema();
@@ -205,7 +205,7 @@ fn invoke_udf(
     let struct_array = StructArray::from(params_batch);
     let mut export_ffi_array = export_ffi_array(&struct_array);
     let mut import_ffi_array = FFI_ArrowArray::empty();
-    jni_call!(SparkAuronUDFWrapperContext(jcontext.as_obj()).eval(
+    jni_call!(AuronUDFWrapperContext(jcontext.as_obj()).eval(
         &mut export_ffi_array as *mut FFI_ArrowArray as i64,
         &mut import_ffi_array as *mut FFI_ArrowArray as i64,
     ) -> ())?;

@@ -16,6 +16,7 @@
  */
 package org.apache.auron.flink.arrow;
 
+import org.apache.arrow.vector.BaseVariableWidthVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.auron.flink.arrow.writers.ArrowFieldWriter;
@@ -53,10 +54,31 @@ public final class FlinkArrowWriter {
      */
     @SuppressWarnings("unchecked")
     public static FlinkArrowWriter create(VectorSchemaRoot root, RowType rowType) {
+        return create(root, rowType, 0, 0.0);
+    }
+
+    /**
+     * Creates a writer and preallocates vectors for a known batch size.
+     *
+     * @param root the Arrow vector schema root to write into
+     * @param rowType the Flink row type describing the schema
+     * @param rowCount the number of rows expected in this batch
+     * @param variableBytesPerRow an estimated byte size per row for variable-width vectors
+     * @return a new writer with vectors allocated for the expected batch size
+     */
+    public static FlinkArrowWriter create(
+            VectorSchemaRoot root, RowType rowType, int rowCount, double variableBytesPerRow) {
         ArrowFieldWriter<RowData>[] fieldWriters =
                 new ArrowFieldWriter[root.getFieldVectors().size()];
         for (int i = 0; i < fieldWriters.length; i++) {
             FieldVector vector = root.getFieldVectors().get(i);
+            if (rowCount > 0) {
+                if (vector instanceof BaseVariableWidthVector && variableBytesPerRow > 0) {
+                    ((BaseVariableWidthVector) vector).setInitialCapacity(rowCount, variableBytesPerRow);
+                } else {
+                    vector.setInitialCapacity(rowCount);
+                }
+            }
             vector.allocateNew();
             fieldWriters[i] = FlinkArrowUtils.createArrowFieldWriterForRow(vector, rowType.getTypeAt(i));
         }

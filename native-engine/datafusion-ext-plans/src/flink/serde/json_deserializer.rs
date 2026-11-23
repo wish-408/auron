@@ -182,6 +182,30 @@ impl JsonDeserializer {
     }
 }
 
+/// Convert Decimal128 fields to Utf8 for JSON parsing.
+///
+/// JSON decimal values are first parsed into strings and then cast back to the
+/// original Decimal128 type after the RecordBatch is built. This reuses the
+/// existing Utf8-to-Decimal128 cast and also handles Decimal128 fields nested
+/// in structs, lists, and maps.
+fn to_json_compatible_field(field: &Field) -> Field {
+    let data_type = match field.data_type() {
+        DataType::Decimal128(..) => DataType::Utf8,
+        DataType::Struct(fields) => DataType::Struct(Fields::from(
+            fields
+                .iter()
+                .map(|f| Arc::new(to_json_compatible_field(f)))
+                .collect::<Vec<_>>(),
+        )),
+        DataType::List(field_ref) => DataType::List(Arc::new(to_json_compatible_field(field_ref))),
+        DataType::Map(field_ref, sorted) => {
+            DataType::Map(Arc::new(to_json_compatible_field(field_ref)), *sorted)
+        }
+        other => other.clone(),
+    };
+    Field::new(field.name(), data_type, field.is_nullable())
+}
+
 /// Build the internal json_schema from the output schema and
 /// nested_msg_mapping. For non-nested fields, the field is copied as-is.
 /// For nested fields (e.g. "address.street"), we reconstruct the struct
@@ -238,10 +262,10 @@ fn transfer_output_schema_to_json_schema(
                 }
             } else {
                 // innermost field mapped directly
-                json_schema_fields.push(field.as_ref().clone());
+                json_schema_fields.push(to_json_compatible_field(field));
             }
         } else {
-            json_schema_fields.push(field.as_ref().clone());
+            json_schema_fields.push(to_json_compatible_field(field));
         }
     }
     Ok(Arc::new(Schema::new(json_schema_fields)))
@@ -867,6 +891,45 @@ mod tests {
             .expect("active column");
         assert!(active_col.value(0));
         assert!(!active_col.value(1));
+    }
+
+    #[test]
+    fn test_parse_json_decimal_messages() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("serialized_kafka_records_partition", DataType::Int32, false),
+            Field::new("serialized_kafka_records_offset", DataType::Int64, false),
+            Field::new("serialized_kafka_records_timestamp", DataType::Int64, false),
+            Field::new("decimal_value", DataType::Decimal128(10, 2), true),
+        ]));
+
+        let nested_mapping = HashMap::new();
+        let mut deserializer = JsonDeserializer::new(schema.clone(), &nested_mapping)
+            .expect("Failed to create JsonDeserializer");
+
+        let msg0 = br#"{"decimal_value": 123.45}"#;
+        let msg1 = br#"{"decimal_value": "678.90"}"#;
+        let msg2 = br#"{"decimal_value": "-1.23"}"#;
+
+        let messages = create_binary_array(vec![msg0.as_ref(), msg1.as_ref(), msg2.as_ref()]);
+        let partitions = create_partition_array(vec![0, 0, 0]);
+        let offsets = create_offset_array(vec![100, 101, 102]);
+        let timestamps = create_timestamp_array(vec![1000, 1001, 1002]);
+
+        let batch = deserializer
+            .parse_messages_with_kafka_meta(&messages, &partitions, &offsets, &timestamps)
+            .expect("Failed to parse decimal messages");
+
+        assert_eq!(batch.num_rows(), 3);
+        let decimal_col = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal column");
+        assert_eq!(decimal_col.precision(), 10);
+        assert_eq!(decimal_col.scale(), 2);
+        assert_eq!(decimal_col.value(0), 12345);
+        assert_eq!(decimal_col.value(1), 67890);
+        assert_eq!(decimal_col.value(2), -123);
     }
 
     #[test]

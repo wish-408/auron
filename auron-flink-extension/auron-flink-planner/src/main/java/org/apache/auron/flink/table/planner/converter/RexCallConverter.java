@@ -84,6 +84,14 @@ import org.apache.flink.table.planner.utils.TableConfigUtils;
  * {@link #isNativelySupportedZone}). The zero-argument form reads the wall clock
  * rather than parsing a string, and becomes {@code Flink_UnixTimestampNow}, which
  * takes no argument and needs no time zone.
+ *
+ * <p>A call to a user-defined {@link org.apache.flink.table.functions.ScalarFunction}
+ * (recognized by its {@link org.apache.flink.table.planner.functions.utils.ScalarSqlFunction}
+ * operator, also {@code OTHER_FUNCTION}) converts through {@link FlinkUdfCallConverter}
+ * into a native UDF wrapper node whose serialized bytes carry a versioned
+ * {@link org.apache.auron.flink.table.function.FlinkUdfPayload}. This is admitted only when
+ * the conversion context enables UDF conversion; a call that cannot serialize or an operand
+ * that fails to convert follows the original failure path (the whole Calc falls back).
  */
 public class RexCallConverter implements FlinkRexNodeConverter {
 
@@ -165,6 +173,12 @@ public class RexCallConverter implements FlinkRexNodeConverter {
         }
         if (call.getOperator() == FlinkSqlOperatorTable.UNIX_TIMESTAMP) {
             return isUnixTimestampSupported(call, context);
+        }
+        // A user-defined ScalarFunction call (SqlKind OTHER_FUNCTION) is matched by operator type;
+        // support depends purely on the context's UDF conversion mode, and probing consumes no
+        // registration order nor touches the function instance.
+        if (FlinkUdfCallConverter.isSupported(call)) {
+            return context.isUdfConversionEnabled();
         }
         SqlKind kind = call.getKind();
         if (!SUPPORTED_KINDS.contains(kind)) {
@@ -256,6 +270,16 @@ public class RexCallConverter implements FlinkRexNodeConverter {
         }
         if (call.getOperator() == FlinkSqlOperatorTable.UNIX_TIMESTAMP) {
             return buildUnixTimestamp(call, context);
+        }
+        if (FlinkUdfCallConverter.isSupported(call)) {
+            try {
+                return FlinkUdfCallConverter.convert(call, factory, context);
+            } catch (Exception e) {
+                // A call that cannot serialize (e.g. a non-serializable function) follows the
+                // original failure path: the factory treats the exception as a conversion failure
+                // and the whole Calc falls back.
+                throw new IllegalStateException("Failed to convert scalar UDF call: " + call, e);
+            }
         }
         SqlKind kind = call.getKind();
         switch (kind) {

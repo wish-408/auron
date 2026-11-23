@@ -18,11 +18,14 @@ package org.apache.auron.flink.table.planner.converter;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.ObjectInputStream;
 import java.math.BigDecimal;
+import java.nio.ByteBuffer;
 import java.time.ZoneId;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -33,11 +36,11 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.auron.flink.table.function.FlinkUdfPayload;
 import org.apache.auron.protobuf.ArrowType;
 import org.apache.auron.protobuf.PhysicalExprNode;
 import org.apache.auron.protobuf.PhysicalScalarFunctionNode;
 import org.apache.auron.protobuf.PhysicalWhenThen;
-import org.apache.auron.protobuf.ScalarFunction;
 import org.apache.calcite.jdbc.JavaTypeFactoryImpl;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
@@ -47,7 +50,12 @@ import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.table.functions.FunctionIdentifier;
+import org.apache.flink.table.functions.ScalarFunction;
+import org.apache.flink.table.planner.calcite.FlinkTypeFactory;
+import org.apache.flink.table.planner.calcite.FlinkTypeSystem;
 import org.apache.flink.table.planner.functions.sql.FlinkSqlOperatorTable;
+import org.apache.flink.table.planner.functions.utils.ScalarSqlFunction;
 import org.apache.flink.table.types.logical.BigIntType;
 import org.apache.flink.table.types.logical.BooleanType;
 import org.apache.flink.table.types.logical.IntType;
@@ -56,12 +64,41 @@ import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.VarCharType;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import scala.Option;
 
 /** Tests for {@link RexCallConverter}. */
 class RexCallConverterTest {
 
     private static final RelDataTypeFactory TYPE_FACTORY = new JavaTypeFactoryImpl();
     private static final RexBuilder REX_BUILDER = new RexBuilder(TYPE_FACTORY);
+    /**
+     * A {@link FlinkTypeFactory} for constructing {@link ScalarSqlFunction} instances; the
+     * factory itself is only stored inside the operator and never consulted by the converter.
+     */
+    private static final FlinkTypeFactory FLINK_TYPE_FACTORY =
+            new FlinkTypeFactory(RexCallConverterTest.class.getClassLoader(), FlinkTypeSystem.INSTANCE);
+
+    /** A minimal serializable UDF: one {@code int -> int} eval, enough for payload serialization. */
+    public static class AddOneUdf extends ScalarFunction {
+        private static final long serialVersionUID = 1L;
+
+        public int eval(int value) {
+            return value + 1;
+        }
+    }
+
+    /** An otherwise valid UDF whose state cannot be serialized (non-serializable field). */
+    public static class UnserializableUdf extends ScalarFunction {
+        private static final long serialVersionUID = 1L;
+
+        private static class UnserializableField {}
+
+        private final UnserializableField boom = new UnserializableField();
+
+        public int eval(int value) {
+            return value;
+        }
+    }
 
     private FlinkNodeConverterFactory factory;
     private RexCallConverter converter;
@@ -535,7 +572,7 @@ class RexCallConverterTest {
         assertTrue(result.hasScalarFunction());
         PhysicalScalarFunctionNode fn = result.getScalarFunction();
         assertEquals("Flink_UnixTimestamp", fn.getName());
-        assertEquals(ScalarFunction.AuronExtFunctions, fn.getFun());
+        assertEquals(org.apache.auron.protobuf.ScalarFunction.AuronExtFunctions, fn.getFun());
         assertEquals(3, fn.getArgsCount(), "Args are always [value, chronoFormat, zoneId]");
         assertEquals(ArrowType.ArrowTypeEnumCase.INT64, fn.getReturnType().getArrowTypeEnumCase());
         assertTrue(fn.getArgs(0).hasColumn(), "First arg is the converted value operand");
@@ -602,7 +639,7 @@ class RexCallConverterTest {
         assertTrue(result.hasScalarFunction());
         PhysicalScalarFunctionNode fn = result.getScalarFunction();
         assertEquals("Flink_UnixTimestampNow", fn.getName());
-        assertEquals(ScalarFunction.AuronExtFunctions, fn.getFun());
+        assertEquals(org.apache.auron.protobuf.ScalarFunction.AuronExtFunctions, fn.getFun());
         assertEquals(0, fn.getArgsCount(), "The zero-argument form carries no native argument");
         assertEquals(ArrowType.ArrowTypeEnumCase.INT64, fn.getReturnType().getArrowTypeEnumCase());
     }
@@ -718,6 +755,95 @@ class RexCallConverterTest {
         assertFalse(converter.isSupported(call, context));
     }
 
+    // ---- Scalar UDF (ScalarSqlFunction) conversion ----
+
+    @Test
+    void testUdfCallNotSupportedWhenUdfConversionDisabled() {
+        // The default context (no UDF scope) is the fusion-processor pass: a UDF-bearing Calc
+        // must not convert there because no operator owns the UDF lifecycle for a fused plan.
+        RexNode call = udfCall(intType(), new AddOneUdf(), makeIntRef(0));
+
+        assertFalse(converter.isSupported(call, context));
+        assertFalse(factory.convertRexNode(call, context).isPresent());
+    }
+
+    @Test
+    void testUdfCallConvertsToWrapperWithPayload() throws Exception {
+        ConverterContext udfContext = udfContext();
+        RexNode call = udfCall(intType(), new AddOneUdf(), makeIntRef(0));
+
+        assertTrue(converter.isSupported(call, udfContext));
+        PhysicalExprNode result = converter.convert(call, udfContext);
+
+        assertTrue(result.hasSparkUdfWrapperExpr());
+        FlinkUdfPayload payload = decodePayload(result);
+        assertEquals("calc:test", payload.getScope());
+        assertEquals(0L, payload.getRegistrationOrder());
+        assertEquals(new AddOneUdf().functionIdentifier(), payload.getFunctionIdentifier());
+        assertTrue(payload.getCallDescriptor().length > 0);
+        assertTrue(result.getSparkUdfWrapperExpr().hasReturnType());
+        assertFalse(result.getSparkUdfWrapperExpr().getReturnNullable());
+        assertEquals(1, result.getSparkUdfWrapperExpr().getParamsCount());
+        assertTrue(result.getSparkUdfWrapperExpr().getParams(0).hasColumn());
+    }
+
+    @Test
+    void testUdfRegistrationOrderFollowsConversionSequence() throws Exception {
+        ConverterContext udfContext = udfContext();
+        RexNode inner = udfCall(intType(), new AddOneUdf(), makeIntRef(0));
+        RexNode outer = udfCall(intType(), new AddOneUdf(), inner);
+
+        // Support probing consumes no registration order...
+        assertTrue(converter.isSupported(outer, udfContext));
+        PhysicalExprNode result = converter.convert(outer, udfContext);
+
+        // ...then the inner call converts as an operand first (order 0) and the outer call
+        // stamps order 1 — the visit sequence in which native codegen registers members.
+        assertEquals(1L, decodePayload(result).getRegistrationOrder());
+        PhysicalExprNode innerNode = result.getSparkUdfWrapperExpr().getParams(0);
+        assertTrue(innerNode.hasSparkUdfWrapperExpr());
+        assertEquals(0L, decodePayload(innerNode).getRegistrationOrder());
+        assertEquals("calc:test", decodePayload(innerNode).getScope());
+
+        // A later conversion of the same pass takes the next order — the counter is per pass.
+        RexNode another = udfCall(intType(), new AddOneUdf(), makeIntRef(1));
+        assertEquals(2L, decodePayload(converter.convert(another, udfContext)).getRegistrationOrder());
+    }
+
+    @Test
+    void testUdfLiteralOperandsRecordConfiguration() throws Exception {
+        ConverterContext udfContext = udfContext();
+        RexNode intLiteral = REX_BUILDER.makeExactLiteral(java.math.BigDecimal.valueOf(5));
+        RexNode nullLiteral = REX_BUILDER.makeNullLiteral(intType());
+        RexNode call = udfCall(intType(), new AddOneUdf(), intLiteral, nullLiteral, makeIntRef(1));
+
+        Object[] descriptor = readDescriptor(
+                decodePayload(converter.convert(call, udfContext)).getCallDescriptor());
+
+        // The eight items the runtime factory reads back, in their fixed order.
+        assertEquals(AddOneUdf.class, descriptor[0].getClass());
+        assertTrue(((String) descriptor[1]).startsWith("{"), "params schema JSON");
+        assertTrue(((String) descriptor[2]).startsWith("{"), "output schema JSON");
+        assertEquals(RowType.of(new IntType(false), new IntType(true), new IntType(false)), descriptor[3]);
+        assertEquals(RowType.of(new IntType(false)), descriptor[4]);
+        assertEquals(Arrays.asList(true, true, false), descriptor[5]);
+        assertEquals(Arrays.asList(false, true, false), descriptor[6]);
+        assertEquals(Arrays.asList(5, null, null), descriptor[7]);
+    }
+
+    @Test
+    void testUnserializableUdfFallsBack() {
+        ConverterContext udfContext = udfContext();
+        RexNode call = udfCall(intType(), new UnserializableUdf(), makeIntRef(0));
+
+        // The probe never touches the instance, so the call still reports supported...
+        assertTrue(converter.isSupported(call, udfContext));
+        // ...but conversion cannot serialize the function and fails, taking the whole Calc
+        // down the fallback path (the factory treats any conversion failure as unsupported).
+        assertThrows(IllegalStateException.class, () -> converter.convert(call, udfContext));
+        assertFalse(factory.convertRexNode(call, udfContext).isPresent());
+    }
+
     // ---- Helpers ----
 
     /** Returns a copy of the shared context whose session time zone is {@code zoneId}. */
@@ -804,5 +930,42 @@ class RexCallConverterTest {
     private static RexNode makeCall(
             RelDataType returnType, org.apache.calcite.sql.SqlOperator op, RexNode... operands) {
         return REX_BUILDER.makeCall(returnType, op, Arrays.asList(operands));
+    }
+
+    /**
+     * Builds a call to a user-defined {@link ScalarFunction} wrapped in the planner's {@link
+     * ScalarSqlFunction} operator — the shape {@code registerFunction} produces. The return
+     * type is explicit so no type inference runs; the converter only reads it.
+     */
+    private static RexNode udfCall(RelDataType returnType, ScalarFunction function, RexNode... operands) {
+        ScalarSqlFunction sqlFunction = new ScalarSqlFunction(
+                FunctionIdentifier.of("test_udf"), "test_udf", function, FLINK_TYPE_FACTORY, Option.empty());
+        return REX_BUILDER.makeCall(returnType, sqlFunction, Arrays.asList(operands));
+    }
+
+    /** Returns a context whose UDF conversion is enabled under the fixed scope {@code calc:test}. */
+    private ConverterContext udfContext() {
+        return new ConverterContext(
+                new Configuration(), null, getClass().getClassLoader(), context.getInputType(), "calc:test");
+    }
+
+    /** Decodes the {@link FlinkUdfPayload} carried by a converted UDF wrapper node. */
+    private static FlinkUdfPayload decodePayload(PhysicalExprNode node) {
+        return FlinkUdfPayload.decode(
+                ByteBuffer.wrap(node.getSparkUdfWrapperExpr().getSerialized().toByteArray()));
+    }
+
+    /**
+     * Reads back the eight descriptor items in the fixed order the converter wrote them and the
+     * runtime factory reads them.
+     */
+    private static Object[] readDescriptor(byte[] descriptor) throws Exception {
+        try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(descriptor))) {
+            Object[] items = new Object[8];
+            for (int i = 0; i < items.length; i++) {
+                items[i] = in.readObject();
+            }
+            return items;
+        }
     }
 }

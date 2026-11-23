@@ -20,11 +20,25 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.google.protobuf.ByteString;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.UUID;
+import org.apache.auron.flink.table.function.FlinkUdfPayload;
+import org.apache.auron.flink.table.function.FlinkUdfToken;
 import org.apache.auron.protobuf.FFIReaderExecNode;
 import org.apache.auron.protobuf.FilterExecNode;
 import org.apache.auron.protobuf.KafkaScanExecNode;
 import org.apache.auron.protobuf.LimitExecNode;
+import org.apache.auron.protobuf.PhysicalBinaryExprNode;
+import org.apache.auron.protobuf.PhysicalColumn;
+import org.apache.auron.protobuf.PhysicalExprNode;
 import org.apache.auron.protobuf.PhysicalPlanNode;
+import org.apache.auron.protobuf.PhysicalSCAndExprNode;
+import org.apache.auron.protobuf.PhysicalSparkUDFWrapperExprNode;
 import org.apache.auron.protobuf.ProjectionExecNode;
 import org.junit.jupiter.api.Test;
 
@@ -107,5 +121,193 @@ class AuronPlanTreeRewriterTest {
                 () -> AuronPlanTreeRewriter.rewriteFfiReaderLeaf(unsupported, leaf -> leaf, "unexpected shape: "));
         assertTrue(ex.getMessage().startsWith("unexpected shape: "));
         assertTrue(ex.getMessage().contains("LIMIT"));
+    }
+
+    // ---- UDF wrapper collect / token rewrite ----
+
+    @Test
+    void udfCollectReturnsEmptyForPlanWithoutWrappers() {
+        PhysicalPlanNode plan = projectWithExprs(project(ffiReader()), column("a"), column("b"));
+
+        assertTrue(AuronPlanTreeRewriter.collectUdfPayloads(plan).isEmpty());
+        // A no-op rewrite with an empty token list rebuilds the same plan.
+        assertEquals(plan, AuronPlanTreeRewriter.rewriteUdfTokens(plan, new ArrayList<>()));
+    }
+
+    @Test
+    void udfCollectAndRewriteShareOneTraversalOrder() {
+        PhysicalExprNode first = udfWrapper("calc:s", 0, column("a"));
+        PhysicalExprNode inner = udfWrapper("calc:s", 1, column("b"));
+        PhysicalExprNode binary = binaryExpr(column("c"), inner);
+        PhysicalPlanNode plan = projectWithExprs(ffiReader(), first, binary);
+
+        List<FlinkUdfPayload> payloads = AuronPlanTreeRewriter.collectUdfPayloads(plan);
+        assertEquals(2, payloads.size());
+        assertEquals(0L, payloads.get(0).getRegistrationOrder());
+        assertEquals(1L, payloads.get(1).getRegistrationOrder());
+        assertEquals("calc:s", payloads.get(0).getScope());
+
+        UUID owner = UUID.randomUUID();
+        List<FlinkUdfToken> tokens = Arrays.asList(new FlinkUdfToken(owner, 0), new FlinkUdfToken(owner, 1));
+        PhysicalPlanNode rewritten = AuronPlanTreeRewriter.rewriteUdfTokens(plan, tokens);
+
+        ProjectionExecNode projection = rewritten.getProjection();
+        // Position 0 wrapper was rewritten with token 0 and kept its param.
+        PhysicalSparkUDFWrapperExprNode firstWrapper = projection.getExpr(0).getSparkUdfWrapperExpr();
+        assertEquals(
+                tokens.get(0),
+                FlinkUdfToken.decode(
+                        ByteBuffer.wrap(firstWrapper.getSerialized().toByteArray())));
+        assertTrue(firstWrapper.getParams(0).hasColumn());
+        // Position 1: the binary survived unchanged on the L branch and its R branch wrapper
+        // (visited second by both passes) received token 1.
+        PhysicalExprNode binaryNode = projection.getExpr(1);
+        assertTrue(binaryNode.getBinaryExpr().getL().hasColumn());
+        assertEquals(
+                tokens.get(1),
+                FlinkUdfToken.decode(ByteBuffer.wrap(binaryNode
+                        .getBinaryExpr()
+                        .getR()
+                        .getSparkUdfWrapperExpr()
+                        .getSerialized()
+                        .toByteArray())));
+        // The spine under the expressions is untouched.
+        assertTrue(projection.getInput().hasFfiReader());
+    }
+
+    @Test
+    void udfTraversalVisitsNestedWrapperParamsBeforeTheOuterWrapper() {
+        // A wrapper whose param is another wrapper: the inner call re-binds first (it converts
+        // first), so the collect order is inner-then-outer in both passes.
+        PhysicalExprNode inner = udfWrapper("calc:s", 0, column("b"));
+        PhysicalExprNode outer = udfWrapper("calc:s", 1, inner);
+        PhysicalPlanNode plan = projectWithExprs(ffiReader(), outer);
+
+        List<FlinkUdfPayload> payloads = AuronPlanTreeRewriter.collectUdfPayloads(plan);
+        assertEquals(2, payloads.size());
+        assertEquals(0L, payloads.get(0).getRegistrationOrder());
+        assertEquals(1L, payloads.get(1).getRegistrationOrder());
+
+        UUID owner = UUID.randomUUID();
+        PhysicalPlanNode rewritten = AuronPlanTreeRewriter.rewriteUdfTokens(
+                plan, Arrays.asList(new FlinkUdfToken(owner, 0), new FlinkUdfToken(owner, 1)));
+        PhysicalSparkUDFWrapperExprNode outerWrapper =
+                rewritten.getProjection().getExpr(0).getSparkUdfWrapperExpr();
+        // Outer received token 1; its param (the inner wrapper) received token 0.
+        assertEquals(
+                new FlinkUdfToken(owner, 1),
+                FlinkUdfToken.decode(
+                        ByteBuffer.wrap(outerWrapper.getSerialized().toByteArray())));
+        assertEquals(
+                new FlinkUdfToken(owner, 0),
+                FlinkUdfToken.decode(ByteBuffer.wrap(outerWrapper
+                        .getParams(0)
+                        .getSparkUdfWrapperExpr()
+                        .getSerialized()
+                        .toByteArray())));
+    }
+
+    @Test
+    void udfRewriteThrowsWhenTokenListDoesNotCoverTheWrappers() {
+        PhysicalPlanNode plan = projectWithExprs(
+                ffiReader(), udfWrapper("calc:s", 0, column("a")), udfWrapper("calc:s", 1, column("b")));
+        UUID owner = UUID.randomUUID();
+
+        IllegalStateException tooFew = assertThrows(
+                IllegalStateException.class,
+                () -> AuronPlanTreeRewriter.rewriteUdfTokens(
+                        plan, Collections.singletonList(new FlinkUdfToken(owner, 0))));
+        assertTrue(tooFew.getMessage().contains("exhausted"));
+
+        IllegalStateException tooMany = assertThrows(
+                IllegalStateException.class,
+                () -> AuronPlanTreeRewriter.rewriteUdfTokens(
+                        plan,
+                        Arrays.asList(
+                                new FlinkUdfToken(owner, 0),
+                                new FlinkUdfToken(owner, 1),
+                                new FlinkUdfToken(owner, 2))));
+        assertTrue(tooMany.getMessage().contains("unconsumed"));
+    }
+
+    @Test
+    void udfTraversalThrowsOnUnknownExpressionType() {
+        // An expression type the walk does not cover must fail fast: an unknown container could
+        // otherwise hide a UDF payload from the binding pass.
+        PhysicalExprNode unknown = PhysicalExprNode.newBuilder()
+                .setScAndExpr(PhysicalSCAndExprNode.newBuilder().build())
+                .build();
+        PhysicalPlanNode plan = projectWithExprs(ffiReader(), unknown);
+
+        IllegalArgumentException ex =
+                assertThrows(IllegalArgumentException.class, () -> AuronPlanTreeRewriter.collectUdfPayloads(plan));
+        assertTrue(ex.getMessage().contains("cannot traverse expression node"));
+        assertTrue(ex.getMessage().contains("SC_AND_EXPR"));
+    }
+
+    @Test
+    void udfTraversalThrowsOnUnknownPlanNodeType() {
+        PhysicalPlanNode limit = PhysicalPlanNode.newBuilder()
+                .setLimit(LimitExecNode.newBuilder().setLimit(1).build())
+                .build();
+        PhysicalPlanNode plan = projectWithExprs(limit, column("a"));
+
+        IllegalArgumentException ex =
+                assertThrows(IllegalArgumentException.class, () -> AuronPlanTreeRewriter.collectUdfPayloads(plan));
+        assertTrue(ex.getMessage().contains("expects Project[Filter[FFIReader]]"));
+        assertTrue(ex.getMessage().contains("LIMIT"));
+    }
+
+    @Test
+    void udfCollectThrowsOnInvalidPayloadBytes() {
+        // Bytes that are not a versioned FlinkUdfPayload must not survive as opaque serialized
+        // state — they fail the collect pass instead of reaching native execution.
+        PhysicalExprNode garbage = PhysicalExprNode.newBuilder()
+                .setSparkUdfWrapperExpr(PhysicalSparkUDFWrapperExprNode.newBuilder()
+                        .setSerialized(ByteString.copyFrom(new byte[] {1, 2, 3}))
+                        .build())
+                .build();
+        PhysicalPlanNode plan = projectWithExprs(ffiReader(), garbage);
+
+        IllegalArgumentException ex =
+                assertThrows(IllegalArgumentException.class, () -> AuronPlanTreeRewriter.collectUdfPayloads(plan));
+        assertTrue(ex.getMessage().contains("payload"));
+    }
+
+    // ---- UDF wrapper helpers ----
+
+    private static PhysicalPlanNode projectWithExprs(PhysicalPlanNode input, PhysicalExprNode... exprs) {
+        ProjectionExecNode.Builder builder = ProjectionExecNode.newBuilder().setInput(input);
+        for (PhysicalExprNode expr : exprs) {
+            builder.addExpr(expr);
+        }
+        return PhysicalPlanNode.newBuilder().setProjection(builder.build()).build();
+    }
+
+    private static PhysicalExprNode column(String name) {
+        return PhysicalExprNode.newBuilder()
+                .setColumn(PhysicalColumn.newBuilder().setName(name).build())
+                .build();
+    }
+
+    private static PhysicalExprNode binaryExpr(PhysicalExprNode left, PhysicalExprNode right) {
+        return PhysicalExprNode.newBuilder()
+                .setBinaryExpr(PhysicalBinaryExprNode.newBuilder()
+                        .setL(left)
+                        .setR(right)
+                        .build())
+                .build();
+    }
+
+    private static PhysicalExprNode udfWrapper(String scope, long order, PhysicalExprNode... params) {
+        PhysicalSparkUDFWrapperExprNode.Builder wrapper = PhysicalSparkUDFWrapperExprNode.newBuilder()
+                .setSerialized(
+                        ByteString.copyFrom(new FlinkUdfPayload(scope, order, "TestUdf", new byte[] {1}).encode()));
+        for (PhysicalExprNode param : params) {
+            wrapper.addParams(param);
+        }
+        return PhysicalExprNode.newBuilder()
+                .setSparkUdfWrapperExpr(wrapper.build())
+                .build();
     }
 }

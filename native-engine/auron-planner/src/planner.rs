@@ -56,8 +56,8 @@ use datafusion_ext_exprs::{
     spark_monotonically_increasing_id::SparkMonotonicallyIncreasingIdExpr,
     spark_partition_id::SparkPartitionIdExpr, spark_randn::SparkRandnExpr,
     spark_scalar_subquery_wrapper::SparkScalarSubqueryWrapperExpr,
-    spark_udf_wrapper::SparkUDFWrapperExpr, string_contains::StringContainsExpr,
-    string_ends_with::StringEndsWithExpr, string_starts_with::StringStartsWithExpr,
+    string_contains::StringContainsExpr, string_ends_with::StringEndsWithExpr,
+    string_starts_with::StringStartsWithExpr, udf_wrapper::UDFWrapperExpr,
 };
 use datafusion_ext_plans::{
     agg::{
@@ -1051,7 +1051,7 @@ impl PhysicalPlanner {
                     Arc::new(datafusion::common::config::ConfigOptions::default()),
                 ))
             }
-            ExprType::SparkUdfWrapperExpr(e) => Arc::new(SparkUDFWrapperExpr::try_new(
+            ExprType::SparkUdfWrapperExpr(e) => Arc::new(UDFWrapperExpr::try_new(
                 e.serialized.clone(),
                 convert_required!(e.return_type)?,
                 e.return_nullable,

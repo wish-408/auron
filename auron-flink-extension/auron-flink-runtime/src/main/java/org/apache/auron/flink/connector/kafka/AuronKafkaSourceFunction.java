@@ -21,6 +21,7 @@ import static org.apache.auron.flink.connector.kafka.KafkaConstants.*;
 import java.io.File;
 import java.io.InputStream;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -30,6 +31,9 @@ import org.apache.auron.flink.configuration.FlinkAuronConfiguration;
 import org.apache.auron.flink.runtime.operator.AuronPlanTreeRewriter;
 import org.apache.auron.flink.runtime.operator.FlinkAuronFunction;
 import org.apache.auron.flink.table.data.AuronColumnarRowData;
+import org.apache.auron.flink.table.function.FlinkUdfLifecycle;
+import org.apache.auron.flink.table.function.FlinkUdfPayload;
+import org.apache.auron.flink.table.function.FlinkUdfToken;
 import org.apache.auron.flink.utils.SchemaConverters;
 import org.apache.auron.jni.AuronAdaptor;
 import org.apache.auron.jni.AuronCallNativeWrapper;
@@ -70,6 +74,7 @@ import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaTopicPartition;
 import org.apache.flink.streaming.connectors.kafka.internals.KafkaTopicPartitionAssigner;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.functions.FunctionContext;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.util.SerializableObject;
@@ -132,6 +137,9 @@ public class AuronKafkaSourceFunction extends RichParallelSourceFunction<RowData
     private transient MetricNode nativeMetric;
     private transient MetricGroup metricGroup;
     private transient ObjectMapper mapper;
+    private transient volatile AuronCallNativeWrapper nativeWrapper;
+    // Owns every UDF instance in the fused plan; null when the plan carries no UDF payload.
+    private transient FlinkUdfLifecycle udfLifecycle;
 
     // Kafka Consumer for partition metadata discovery only (does NOT consume data)
     private transient KafkaConsumer<byte[], byte[]> kafkaConsumer;
@@ -279,6 +287,7 @@ public class AuronKafkaSourceFunction extends RichParallelSourceFunction<RowData
         this.physicalPlanNode = sourcePlan.build();
 
         this.physicalPlanNode = applyMergedCalcPlan(this.physicalPlanNode);
+        bindUdfLifecycle();
 
         // 3. Initialize per-partition WatermarkGenerators if watermarkStrategy is set
         if (watermarkStrategy != null) {
@@ -338,22 +347,10 @@ public class AuronKafkaSourceFunction extends RichParallelSourceFunction<RowData
 
     @Override
     public void run(SourceContext<RowData> sourceContext) throws Exception {
+        Exception runFailure = null;
         metricGroup = getRuntimeContext().getMetricGroup();
-        final Map<String, Counter> flinkCounters = new HashMap<>();
-
-        nativeMetric = new MetricNode(new ArrayList<>()) {
-            @Override
-            public void add(String name, long value) {
-                // Integration with Flink metrics
-                Counter counter = flinkCounters.get(name);
-                if (counter == null) {
-                    counter = metricGroup.counter(name);
-                    flinkCounters.put(name, counter);
-                }
-                counter.inc(value);
-                LOG.debug("Metric Auron Source: {} = {}", name, value);
-            }
-        };
+        final Map<String, Counter> flinkCounters = new ConcurrentHashMap<>();
+        nativeMetric = buildNativeMetricTree(physicalPlanNode, metricGroup, flinkCounters);
         // The native output carries [meta, logical], where logical is the projected output when a
         // merged Calc plan is active and the original output otherwise. The metadata column count
         // and per-field positions both derive from KAFKA_AURON_META_FIELDS so adding or reordering
@@ -381,56 +378,73 @@ public class AuronKafkaSourceFunction extends RichParallelSourceFunction<RowData
                 0,
                 0,
                 AuronAdaptor.getInstance().getAuronConfiguration().getLong(FlinkAuronConfiguration.NATIVE_MEMORY_SIZE));
+        this.nativeWrapper = wrapper;
 
-        if (enableWatermark) {
-            // Per-partition watermark path: each partition has its own WatermarkGenerator
-            // with a capture-only WatermarkOutput. Combined watermark = min(non-idle partitions).
-            while (wrapper.loadNextBatch(batch -> {
-                if (isRunning) {
-                    Map<Integer, Long> tmpOffsets = new HashMap<>(currentOffsets);
-                    FlinkArrowReader arrowReader = FlinkArrowReader.create(batch, auronOutputRowType, metaCount);
-                    for (int i = 0; i < batch.getRowCount(); i++) {
-                        AuronColumnarRowData tmpRowData = (AuronColumnarRowData) arrowReader.read(i);
-                        int partitionId = tmpRowData.getInt(partitionIdx);
-                        long offset = tmpRowData.getLong(offsetIdx);
-                        long kafkaTimestamp = tmpRowData.getLong(timestampIdx);
-                        tmpOffsets.put(partitionId, offset);
+        try {
+            if (enableWatermark) {
+                // Per-partition watermark path: each partition has its own WatermarkGenerator
+                // with a capture-only WatermarkOutput. Combined watermark = min(non-idle partitions).
+                while (wrapper.loadNextBatch(batch -> {
+                    if (isRunning) {
+                        Map<Integer, Long> tmpOffsets = new HashMap<>(currentOffsets);
+                        FlinkArrowReader arrowReader = FlinkArrowReader.create(batch, auronOutputRowType, metaCount);
+                        for (int i = 0; i < batch.getRowCount(); i++) {
+                            AuronColumnarRowData tmpRowData = (AuronColumnarRowData) arrowReader.read(i);
+                            int partitionId = tmpRowData.getInt(partitionIdx);
+                            long offset = tmpRowData.getLong(offsetIdx);
+                            long kafkaTimestamp = tmpRowData.getLong(timestampIdx);
+                            tmpOffsets.put(partitionId, offset);
 
-                        // Feed into the partition's own generator (output captures, does NOT forward)
-                        PartitionWatermarkTracker tracker = getOrCreateTracker(partitionId);
-                        tracker.generator.onEvent(tmpRowData, kafkaTimestamp, tracker.output);
+                            // Feed into the partition's own generator (output captures, does NOT forward)
+                            PartitionWatermarkTracker tracker = getOrCreateTracker(partitionId);
+                            tracker.generator.onEvent(tmpRowData, kafkaTimestamp, tracker.output);
 
-                        sourceContext.collectWithTimestamp(tmpRowData, kafkaTimestamp);
+                            sourceContext.collectWithTimestamp(tmpRowData, kafkaTimestamp);
+                        }
+                        // After batch: trigger onPeriodicEmit for all partitions, then combine and emit
+                        for (PartitionWatermarkTracker tracker : partitionWatermarkTrackers.values()) {
+                            tracker.generator.onPeriodicEmit(tracker.output);
+                        }
+                        emitCombinedWatermark(sourceContext);
+                        synchronized (lock) {
+                            currentOffsets = tmpOffsets;
+                        }
                     }
-                    // After batch: trigger onPeriodicEmit for all partitions, then combine and emit
-                    for (PartitionWatermarkTracker tracker : partitionWatermarkTrackers.values()) {
-                        tracker.generator.onPeriodicEmit(tracker.output);
+                })) {}
+            } else {
+                // No-watermark path: still use collectWithTimestamp with kafka timestamp
+                while (wrapper.loadNextBatch(batch -> {
+                    if (isRunning) {
+                        Map<Integer, Long> tmpOffsets = new HashMap<>(currentOffsets);
+                        FlinkArrowReader arrowReader = FlinkArrowReader.create(batch, auronOutputRowType, metaCount);
+                        for (int i = 0; i < batch.getRowCount(); i++) {
+                            AuronColumnarRowData tmpRowData = (AuronColumnarRowData) arrowReader.read(i);
+                            int partitionId = tmpRowData.getInt(partitionIdx);
+                            long offset = tmpRowData.getLong(offsetIdx);
+                            long kafkaTimestamp = tmpRowData.getLong(timestampIdx);
+                            tmpOffsets.put(partitionId, offset);
+                            sourceContext.collectWithTimestamp(tmpRowData, kafkaTimestamp);
+                        }
+                        synchronized (lock) {
+                            currentOffsets = tmpOffsets;
+                        }
                     }
-                    emitCombinedWatermark(sourceContext);
-                    synchronized (lock) {
-                        currentOffsets = tmpOffsets;
-                    }
+                })) {}
+            }
+        } catch (Exception failure) {
+            runFailure = failure;
+            throw failure;
+        } finally {
+            Throwable releaseFailure = releaseNativeWrapper();
+            if (releaseFailure != null) {
+                if (runFailure != null) {
+                    runFailure.addSuppressed(releaseFailure);
+                } else if (releaseFailure instanceof Exception) {
+                    throw (Exception) releaseFailure;
+                } else {
+                    throw (Error) releaseFailure;
                 }
-            })) {}
-        } else {
-            // No-watermark path: still use collectWithTimestamp with kafka timestamp
-            while (wrapper.loadNextBatch(batch -> {
-                if (isRunning) {
-                    Map<Integer, Long> tmpOffsets = new HashMap<>(currentOffsets);
-                    FlinkArrowReader arrowReader = FlinkArrowReader.create(batch, auronOutputRowType, metaCount);
-                    for (int i = 0; i < batch.getRowCount(); i++) {
-                        AuronColumnarRowData tmpRowData = (AuronColumnarRowData) arrowReader.read(i);
-                        int partitionId = tmpRowData.getInt(partitionIdx);
-                        long offset = tmpRowData.getLong(offsetIdx);
-                        long kafkaTimestamp = tmpRowData.getLong(timestampIdx);
-                        tmpOffsets.put(partitionId, offset);
-                        sourceContext.collectWithTimestamp(tmpRowData, kafkaTimestamp);
-                    }
-                    synchronized (lock) {
-                        currentOffsets = tmpOffsets;
-                    }
-                }
-            })) {}
+            }
         }
         LOG.info("Auron kafka source run end");
     }
@@ -438,11 +452,60 @@ public class AuronKafkaSourceFunction extends RichParallelSourceFunction<RowData
     @Override
     public void cancel() {
         this.isRunning = false;
+        // Stop UDFs first so late JNI calls are rejected, then ask the native runtime to
+        // terminate instead of waiting for the next batch callback to observe isRunning=false.
+        stopUdfLifecycle();
+        Throwable failure = releaseNativeWrapper();
+        if (failure != null) {
+            LOG.warn("Fail to terminate the Auron Kafka native runtime during cancellation", failure);
+        }
+    }
+
+    /**
+     * Builds a metric tree matching {@code node}. Native finalization walks the physical plan and
+     * resolves each operator's metric target through child indices, so a fused
+     * Project[Filter?[KafkaScan]] plan needs the same child hierarchy.
+     */
+    private static MetricNode buildNativeMetricTree(
+            PhysicalPlanNode node, MetricGroup metricGroup, Map<String, Counter> flinkCounters) {
+        final List<MetricNode> children;
+        if (node.hasKafkaScan()) {
+            children = Collections.emptyList();
+        } else if (node.hasProjection()) {
+            children = Collections.singletonList(
+                    buildNativeMetricTree(node.getProjection().getInput(), metricGroup, flinkCounters));
+        } else if (node.hasFilter()) {
+            children = Collections.singletonList(
+                    buildNativeMetricTree(node.getFilter().getInput(), metricGroup, flinkCounters));
+        } else {
+            throw new IllegalArgumentException(
+                    "Unexpected plan node type for metric tree: " + node.getPhysicalPlanTypeCase());
+        }
+
+        return new MetricNode(children) {
+            @Override
+            public void add(String name, long value) {
+                Counter counter = flinkCounters.computeIfAbsent(name, metricGroup::counter);
+                counter.inc(value);
+                LOG.debug("Metric Auron Source: {} = {}", name, value);
+            }
+        };
     }
 
     @Override
     public void close() throws Exception {
         this.isRunning = false;
+        stopUdfLifecycle();
+        Throwable failure = releaseNativeWrapper();
+        if (udfLifecycle != null) {
+            FlinkUdfLifecycle lifecycle = udfLifecycle;
+            udfLifecycle = null;
+            try {
+                lifecycle.close();
+            } catch (Throwable error) {
+                failure = suppress(failure, error);
+            }
+        }
 
         // Shut down partition discovery scheduler before closing the consumer it uses
         if (partitionDiscoveryScheduler != null) {
@@ -455,10 +518,76 @@ public class AuronKafkaSourceFunction extends RichParallelSourceFunction<RowData
 
         // Close the metadata-only Kafka Consumer
         if (kafkaConsumer != null) {
-            kafkaConsumer.close();
+            try {
+                kafkaConsumer.close();
+            } catch (Throwable error) {
+                failure = suppress(failure, error);
+            }
         }
 
-        super.close();
+        try {
+            super.close();
+        } catch (Throwable error) {
+            failure = suppress(failure, error);
+        }
+
+        if (failure != null) {
+            throw propagate(failure);
+        }
+    }
+
+    private void bindUdfLifecycle() throws Exception {
+        List<FlinkUdfPayload> payloads = AuronPlanTreeRewriter.collectUdfPayloads(physicalPlanNode);
+        if (payloads.isEmpty()) {
+            return;
+        }
+        this.udfLifecycle = new FlinkUdfLifecycle();
+        List<FlinkUdfToken> tokens = udfLifecycle.openAndBind(
+                payloads,
+                new FunctionContext(getRuntimeContext()),
+                getRuntimeContext().getUserCodeClassLoader());
+        this.physicalPlanNode = AuronPlanTreeRewriter.rewriteUdfTokens(physicalPlanNode, tokens);
+    }
+
+    private void stopUdfLifecycle() {
+        if (udfLifecycle != null) {
+            udfLifecycle.stop();
+        }
+    }
+
+    private Throwable releaseNativeWrapper() {
+        AuronCallNativeWrapper wrapper = nativeWrapper;
+        nativeWrapper = null;
+        if (wrapper == null) {
+            return null;
+        }
+        try {
+            wrapper.close();
+            return null;
+        } catch (Throwable failure) {
+            LOG.warn("Fail to close the Auron Kafka native wrapper", failure);
+            return failure;
+        }
+    }
+
+    private static Throwable suppress(Throwable failure, Throwable error) {
+        if (failure == null) {
+            return error;
+        }
+        if (failure != error) {
+            failure.addSuppressed(error);
+        }
+        return failure;
+    }
+
+    private static Exception propagate(Throwable failure) {
+        if (failure instanceof Exception) {
+            return (Exception) failure;
+        }
+        if (failure instanceof Error) {
+            throw (Error) failure;
+        }
+        return new RuntimeException(failure);
     }
 
     @Override

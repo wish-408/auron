@@ -19,6 +19,7 @@ package org.apache.auron.flink.table.planner.converter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import javax.annotation.Nullable;
 import org.apache.auron.flink.table.planner.UnsupportedFlinkNodeRecorder;
 import org.apache.auron.flink.utils.SchemaConverters;
@@ -42,10 +43,33 @@ import org.slf4j.LoggerFactory;
  * the shadowed {@code StreamExecCalc} (standalone native Calc) and the graph-level fusion processor
  * build the same sub-plan through {@link #buildNativeCalcPlan}; keeping it here avoids duplicating
  * the converter-framework walk and the {@code FFIReader} leaf assembly.
+ *
+ * <p>UDF handling is caller-scoped through {@link UdfConversion}: the standalone native Calc path
+ * converts user-defined function calls into wrapper nodes (the Calc operator owns their lifecycle),
+ * while callers that have not staged a UDF lifecycle owner leave them unsupported so the Calc does
+ * not run a plan whose UDF payloads nothing will bind.
  */
 public final class NativePlanFusionBuilder {
 
     private static final Logger LOG = LoggerFactory.getLogger(NativePlanFusionBuilder.class);
+
+    /**
+     * Whether a plan composition admits converting user-defined ScalarFunction calls to native UDF
+     * wrapper nodes.
+     *
+     * <ul>
+     *   <li>{@link #ENABLED} — UDF calls convert; each converted call's payload carries the
+     *       composition's per-Calc scope and a registration order, so the runtime lifecycle can
+     *       share or isolate function instances like the native codegen it replaces.
+     *   <li>{@link #DISABLED} — UDF calls report unsupported, so the whole composition fails and
+     *       the Calc runs through a path that owns the UDF lifecycle (for the fusion processor:
+     *       unfused, as a standalone native Calc or Flink codegen).
+     * </ul>
+     */
+    public enum UdfConversion {
+        ENABLED,
+        DISABLED
+    }
 
     private NativePlanFusionBuilder() {
         // utility class
@@ -53,15 +77,8 @@ public final class NativePlanFusionBuilder {
 
     /**
      * Attempts to compose a native {@code Project[Filter?[FFIReader-placeholder]]} plan from the
-     * given projection and condition. Returns {@link Optional#empty()} if any {@link RexNode} is
-     * unsupported by the converter framework, or if plan composition throws — both signals are the
-     * same for the caller: the Calc cannot run natively.
-     *
-     * <p>The outer {@link Throwable} catch is defence-in-depth: the converter framework already
-     * catches per-{@link RexNode} {@link Exception}, but {@link SchemaConverters} can throw {@link
-     * UnsupportedOperationException} on a {@link RowType} containing an unsupported logical type, and
-     * protobuf composition can theoretically throw on invalid inputs. Treating any failure as an
-     * empty result keeps the caller safe.
+     * given projection and condition with UDF conversion disabled; see
+     * {@link #buildNativeCalcPlan(ReadableConfig, List, RexNode, RowType, RowType, UdfConversion)}.
      *
      * @param tableConfig the table-level configuration used to seed the converter context
      * @param projection the projection expressions evaluated per row
@@ -76,12 +93,49 @@ public final class NativePlanFusionBuilder {
             @Nullable RexNode condition,
             RowType inputRowType,
             RowType outputRowType) {
+        return buildNativeCalcPlan(
+                tableConfig, projection, condition, inputRowType, outputRowType, UdfConversion.DISABLED);
+    }
+
+    /**
+     * Attempts to compose a native {@code Project[Filter?[FFIReader-placeholder]]} plan from the
+     * given projection and condition. Returns {@link Optional#empty()} if any {@link RexNode} is
+     * unsupported by the converter framework, or if plan composition throws — both signals are the
+     * same for the caller: the Calc cannot run natively.
+     *
+     * <p>The outer {@link Throwable} catch is defence-in-depth: the converter framework already
+     * catches per-{@link RexNode} {@link Exception}, but {@link SchemaConverters} can throw {@link
+     * UnsupportedOperationException} on a {@link RowType} containing an unsupported logical type, and
+     * protobuf composition can theoretically throw on invalid inputs. Treating any failure as an
+     * empty result keeps the caller safe.
+     *
+     * <p>The converter context converts the condition first and then the projection columns in
+     * order, and nested expressions in operand order — the same sequence in which the native Calc
+     * codegen registers its function references — so UDF registration orders embedded in the plan
+     * payloads reproduce native instance-sharing semantics.
+     *
+     * @param tableConfig the table-level configuration used to seed the converter context
+     * @param projection the projection expressions evaluated per row
+     * @param condition the filter expression evaluated per row, or {@code null} for no filter
+     * @param inputRowType the upstream row type used by the converter context
+     * @param outputRowType the row type of this Calc's output
+     * @param udfConversion whether user-defined function calls convert to native wrapper nodes
+     * @return a composed plan, or empty if conversion failed
+     */
+    public static Optional<PhysicalPlanNode> buildNativeCalcPlan(
+            ReadableConfig tableConfig,
+            List<RexNode> projection,
+            @Nullable RexNode condition,
+            RowType inputRowType,
+            RowType outputRowType,
+            UdfConversion udfConversion) {
         try {
             final ConverterContext ctx = new ConverterContext(
                     tableConfig,
                     AuronAdaptor.getInstance().getAuronConfiguration(),
                     Thread.currentThread().getContextClassLoader(),
-                    inputRowType);
+                    inputRowType,
+                    udfConversion == UdfConversion.ENABLED ? newUdfScope() : null);
             final FlinkNodeConverterFactory converters = FlinkNodeConverterFactory.getInstance();
 
             PhysicalExprNode filterExpr = null;
@@ -142,6 +196,16 @@ public final class NativePlanFusionBuilder {
                     t);
             return Optional.empty();
         }
+    }
+
+    /**
+     * Mints the per-Calc scope for one UDF-enabled composition. Each composition call serves one
+     * original Calc, so a fresh unique scope guarantees functions of different Calcs never merge
+     * into one shared instance; all parallel subtasks of the Calc operator share this scope through
+     * the same serialized plan and stay isolated through their own per-subtask lifecycle.
+     */
+    private static String newUdfScope() {
+        return "calc:" + UUID.randomUUID();
     }
 
     /**
