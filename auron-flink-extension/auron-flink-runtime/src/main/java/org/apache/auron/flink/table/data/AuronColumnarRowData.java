@@ -21,6 +21,9 @@ import static org.apache.flink.util.Preconditions.checkArgument;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Constructor;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.table.data.*;
 import org.apache.flink.table.data.binary.TypedSetters;
@@ -50,6 +53,55 @@ public class AuronColumnarRowData implements RowData, TypedSetters {
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Failed to access String internal constructor", e);
         }
+    }
+
+    /**
+     * 判断当前行的 UTF-8 数据是否全是 ASCII。
+     *
+     * <p>ASCII 的特点是所有字节都小于 0x80。此时 UTF-8 bytes 可以直接当成
+     * Java String 的 Latin1 内部表示使用，coder=0。
+     */
+    private static boolean isAscii(BytesColumnVector.Bytes bytes) {
+        byte[] data = bytes.data;
+        int start = bytes.offset;
+        int end = start + bytes.len;
+
+        // 一次性 wrap，后面用 absolute getLong 读
+        ByteBuffer buffer = ByteBuffer.wrap(data).order(ByteOrder.nativeOrder());
+
+        long utf8HighBitMask = 0x8080808080808080L;
+
+        // 32 字节一轮：4 个 long
+        while (start + 32 <= end) {
+            long w0 = buffer.getLong(start);
+            long w1 = buffer.getLong(start + 8);
+            long w2 = buffer.getLong(start + 16);
+            long w3 = buffer.getLong(start + 24);
+
+            if (((w0 | w1 | w2 | w3) & utf8HighBitMask) != 0L) {
+                return false;
+            }
+            start += 32;
+        }
+
+        // 剩余部分：8 字节一轮
+        while (start + Long.BYTES <= end) {
+            long word = buffer.getLong(start);
+            if ((word & utf8HighBitMask) != 0L) {
+                return false;
+            }
+            start += Long.BYTES;
+        }
+
+        // 末尾不足 8 字节
+        while (start < end) {
+            if ((data[start] & 0x80) != 0) {
+                return false;
+            }
+            start++;
+        }
+
+        return true;
     }
 
     public AuronColumnarRowData() {
@@ -133,16 +185,32 @@ public class AuronColumnarRowData implements RowData, TypedSetters {
         // 注意，需要rust侧保证写入native memory的字符串已经是java的LATIN1编码
         BytesColumnVector.Bytes byteArray =
                 this.vectorizedColumnBatch.getByteArray(this.rowId, pos + dataColStartIndex);
-        try {
-            // 零拷贝构造String对象，直接把byteArray的data传给String
-            String value = (String) INTERNAL_STRING_CONSTRUCTOR.invokeExact(byteArray.data, (byte) 0);
-            return StringData.fromString(value);
-        } catch (Throwable ignoredException) {
-            String value = new String(byteArray.data);
-            return StringData.fromString(value);
+
+        // try {
+        //     // 零拷贝构造String对象，直接把byteArray的data传给String
+        //     String value = (String) INTERNAL_STRING_CONSTRUCTOR.invokeExact(byteArray.data, (byte) 0);
+        //     return StringData.fromString(value);
+        // } catch (Throwable ignoredException) {
+        //     String value = new String(byteArray.data);
+        //     return StringData.fromString(value);
+        // }
+        if (isAscii(byteArray)) { // ASCII字符串的fast path
+            try {
+                // 零拷贝构造String对象，直接把byteArray的data传给String
+                String value = (String) INTERNAL_STRING_CONSTRUCTOR.invokeExact(byteArray.data, (byte) 0);
+                return StringData.fromString(value);
+            } catch (Throwable ignoredException) {
+                // 走降级路径，使用String公开的构造函数
+            }
         }
-        // String value = new String(byteArray.data); // 会多一次从byteArray.data到String内部缓冲区的拷贝
-        // return StringData.fromString(value);
+
+        String value = new String(
+                byteArray.data,
+                byteArray.offset,
+                byteArray.len,
+                StandardCharsets.UTF_8); // 会多一次从byteArray.data到String内部缓冲区的拷贝
+
+        return StringData.fromString(value);
         // [wsh_dev] 此处可通过 (byteArray.data, byteArray.offset, byteArray.len)构建一个String对象，返回缓存了String对象的StringData
         // 后续调用udf时会把StringData变成String，缓存了之后可以直接返回String而不用再构建新的String
         // return StringData.fromBytes(byteArray.data, byteArray.offset, byteArray.len);

@@ -107,7 +107,7 @@ public final class FlinkUDFWrapperContext implements AuronUDFWrapperContext {
             try (FlinkArrowReader arrowReader = FlinkArrowReader.create(paramsRoot, paramRowType)) {
                 int rowCount = paramsRoot.getRowCount();
                 FlinkArrowWriter arrowWriter = FlinkArrowWriter.create(
-                        outputRoot, outputRowType, rowCount, estimateOutputBytesPerRow(paramsRoot));
+                        outputRoot, outputRowType, rowCount, 3 * estimateOutputBytesPerRow(paramsRoot));
                 GenericRowData outputRow = new GenericRowData(outputRowType.getFieldCount());
                 for (int i = 0; i < rowCount; i++) {
                     RowData row = arrowReader.read(i);

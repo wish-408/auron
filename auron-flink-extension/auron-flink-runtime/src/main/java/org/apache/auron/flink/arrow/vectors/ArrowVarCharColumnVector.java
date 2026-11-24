@@ -64,8 +64,10 @@ public final class ArrowVarCharColumnVector implements BytesColumnVector {
         }
         int start = vector.getStartOffset(i);
         int end = vector.getEndOffset(i);
+
         int length = end - start;
         byte[] data = new byte[length];
+
         // 把arrow中的数据拷贝到堆上的byte[]
         vector.getDataBuffer().getBytes(start, data, 0, length);
 
