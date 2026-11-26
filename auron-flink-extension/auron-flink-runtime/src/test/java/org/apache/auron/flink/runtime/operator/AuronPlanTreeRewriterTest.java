@@ -17,6 +17,7 @@
 package org.apache.auron.flink.runtime.operator;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -29,6 +30,8 @@ import java.util.List;
 import java.util.UUID;
 import org.apache.auron.flink.table.function.FlinkUdfPayload;
 import org.apache.auron.flink.table.function.FlinkUdfToken;
+import org.apache.auron.protobuf.ArrowType;
+import org.apache.auron.protobuf.EmptyMessage;
 import org.apache.auron.protobuf.FFIReaderExecNode;
 import org.apache.auron.protobuf.FilterExecNode;
 import org.apache.auron.protobuf.KafkaScanExecNode;
@@ -124,6 +127,100 @@ class AuronPlanTreeRewriterTest {
     }
 
     // ---- UDF wrapper collect / token rewrite ----
+
+    @Test
+    void udfGroupCollectReturnsEmptyForPlanWithoutWrappers() {
+        PhysicalPlanNode plan = projectWithExprs(project(ffiReader()), column("a"), column("b"));
+
+        assertTrue(AuronPlanTreeRewriter.collectUdfPayloadGroups(plan).isEmpty());
+    }
+
+    @Test
+    void udfGroupCollectMergesStrictChainAndKeepsSeparateWrapperAsItsOwnGroup() {
+        PhysicalExprNode inner = udfWrapper("calc:s", 0, intArrowType(), false, "udf1", column("a"));
+        PhysicalExprNode middle = udfWrapper("calc:s", 1, intArrowType(), false, "udf2", inner);
+        PhysicalExprNode outer = udfWrapper("calc:s", 2, utf8ArrowType(), true, "udf3", middle);
+        PhysicalExprNode separate = udfWrapper("calc:s", 3, boolArrowType(), false, "udf4", column("b"));
+        PhysicalPlanNode plan = projectWithExprs(ffiReader(), outer, separate);
+
+        List<AuronPlanTreeRewriter.FlinkUdfGroup> groups = AuronPlanTreeRewriter.collectUdfPayloadGroups(plan);
+
+        assertEquals(2, groups.size());
+        assertEquals(
+                Arrays.asList(0L, 1L, 2L),
+                Arrays.asList(
+                        groups.get(0).payloads().get(0).getRegistrationOrder(),
+                        groups.get(0).payloads().get(1).getRegistrationOrder(),
+                        groups.get(0).payloads().get(2).getRegistrationOrder()));
+        assertEquals(3, groups.get(0).wrappers().size());
+        assertEquals(1, groups.get(1).payloads().size());
+        assertEquals(3L, groups.get(1).payloads().get(0).getRegistrationOrder());
+    }
+
+    @Test
+    void udfGroupCollectDoesNotMergeWrapperSeparatedByNativeExpression() {
+        PhysicalExprNode inner = udfWrapper("calc:s", 0, intArrowType(), false, "udf1", column("a"));
+        PhysicalExprNode plus = binaryExpr(inner, column("one"));
+        PhysicalExprNode outer = udfWrapper("calc:s", 1, intArrowType(), false, "udf2", plus);
+        PhysicalPlanNode plan = projectWithExprs(ffiReader(), outer);
+
+        List<AuronPlanTreeRewriter.FlinkUdfGroup> groups = AuronPlanTreeRewriter.collectUdfPayloadGroups(plan);
+
+        assertEquals(2, groups.size());
+        assertEquals(0L, groups.get(0).payloads().get(0).getRegistrationOrder());
+        assertEquals(1, groups.get(0).payloads().size());
+        assertEquals(1L, groups.get(1).payloads().get(0).getRegistrationOrder());
+        assertEquals(1, groups.get(1).payloads().size());
+    }
+
+    @Test
+    void udfGroupRewriteCollapsesChainToSingleWrapperWithGroupToken() {
+        PhysicalExprNode inner = udfWrapper("calc:s", 0, intArrowType(), false, "udf1", column("x"));
+        PhysicalExprNode middle = udfWrapper("calc:s", 1, intArrowType(), false, "udf2", inner);
+        PhysicalExprNode outer = udfWrapper("calc:s", 2, utf8ArrowType(), true, "udf3", middle);
+        PhysicalPlanNode plan = projectWithExprs(ffiReader(), outer);
+
+        List<AuronPlanTreeRewriter.FlinkUdfGroup> groups = AuronPlanTreeRewriter.collectUdfPayloadGroups(plan);
+        assertEquals(1, groups.size());
+        AuronPlanTreeRewriter.FlinkUdfGroup group = groups.get(0);
+
+        FlinkUdfToken token = new FlinkUdfToken(UUID.randomUUID(), 99);
+        group.bindToken(token);
+
+        PhysicalPlanNode rewritten = AuronPlanTreeRewriter.rewriteGroupedUdfTokens(plan, group);
+
+        PhysicalSparkUDFWrapperExprNode wrapper =
+                rewritten.getProjection().getExpr(0).getSparkUdfWrapperExpr();
+        assertEquals(
+                token,
+                FlinkUdfToken.decode(ByteBuffer.wrap(wrapper.getSerialized().toByteArray())));
+        assertEquals(utf8ArrowType(), wrapper.getReturnType());
+        assertTrue(wrapper.getReturnNullable());
+        assertEquals(1, wrapper.getParamsCount());
+        assertEquals(group.wrappers().get(0).getParams(0), wrapper.getParams(0));
+        assertEquals("udf3", wrapper.getExprString());
+
+        // The original plan is immutable: the caller can retry or inspect it after rewrite.
+        PhysicalSparkUDFWrapperExprNode originalOuter =
+                plan.getProjection().getExpr(0).getSparkUdfWrapperExpr();
+        assertNotEquals(originalOuter, wrapper);
+        assertEquals(1, originalOuter.getParamsCount());
+        assertTrue(originalOuter.getParams(0).hasSparkUdfWrapperExpr());
+    }
+
+    @Test
+    void udfGroupRewriteThrowsWhenGroupTokenIsNotBound() {
+        PhysicalExprNode inner = udfWrapper("calc:s", 0, intArrowType(), false, "udf1", column("a"));
+        PhysicalExprNode outer = udfWrapper("calc:s", 1, intArrowType(), false, "udf2", inner);
+        PhysicalPlanNode plan = projectWithExprs(ffiReader(), outer);
+
+        List<AuronPlanTreeRewriter.FlinkUdfGroup> groups = AuronPlanTreeRewriter.collectUdfPayloadGroups(plan);
+        assertEquals(1, groups.size());
+
+        IllegalStateException ex = assertThrows(
+                IllegalStateException.class, () -> AuronPlanTreeRewriter.rewriteGroupedUdfTokens(plan, groups.get(0)));
+        assertTrue(ex.getMessage().contains("尚未绑定 token"));
+    }
 
     @Test
     void udfCollectReturnsEmptyForPlanWithoutWrappers() {
@@ -300,14 +397,41 @@ class AuronPlanTreeRewriterTest {
     }
 
     private static PhysicalExprNode udfWrapper(String scope, long order, PhysicalExprNode... params) {
+        return udfWrapper(scope, order, intArrowType(), false, "TestUdf", params);
+    }
+
+    private static PhysicalExprNode udfWrapper(
+            String scope,
+            long order,
+            ArrowType returnType,
+            boolean returnNullable,
+            String exprString,
+            PhysicalExprNode... params) {
         PhysicalSparkUDFWrapperExprNode.Builder wrapper = PhysicalSparkUDFWrapperExprNode.newBuilder()
                 .setSerialized(
                         ByteString.copyFrom(new FlinkUdfPayload(scope, order, "TestUdf", new byte[] {1}).encode()));
+        wrapper.setReturnType(returnType);
+        wrapper.setReturnNullable(returnNullable);
+        wrapper.setExprString(exprString);
         for (PhysicalExprNode param : params) {
             wrapper.addParams(param);
         }
         return PhysicalExprNode.newBuilder()
                 .setSparkUdfWrapperExpr(wrapper.build())
                 .build();
+    }
+
+    private static ArrowType intArrowType() {
+        return ArrowType.newBuilder()
+                .setINT32(EmptyMessage.getDefaultInstance())
+                .build();
+    }
+
+    private static ArrowType utf8ArrowType() {
+        return ArrowType.newBuilder().setUTF8(EmptyMessage.getDefaultInstance()).build();
+    }
+
+    private static ArrowType boolArrowType() {
+        return ArrowType.newBuilder().setBOOL(EmptyMessage.getDefaultInstance()).build();
     }
 }

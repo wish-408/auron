@@ -27,7 +27,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
-import org.apache.auron.functions.AuronUDFWrapperContext;
+import javax.annotation.Nullable;
+import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.functions.FunctionContext;
 import org.apache.flink.table.functions.ScalarFunction;
 
@@ -42,16 +43,16 @@ public final class FlinkUdfLifecycle implements AutoCloseable {
     public interface ContextFactory {
         ScalarFunction resolveFunction(FlinkUdfPayload payload, ClassLoader classLoader) throws Exception;
 
-        AuronUDFWrapperContext createContext(FlinkUdfPayload payload, FlinkUdfInstance instance) throws Exception;
+        FlinkRowLevelUdfContext createContext(FlinkUdfPayload payload, FlinkUdfInstance instance) throws Exception;
     }
 
     private final UUID owner = UUID.randomUUID();
     private final AtomicReference<State> state = new AtomicReference<>(State.OPENING);
     private final Map<InstanceKey, FlinkUdfInstance> instances = new LinkedHashMap<>();
     private final Map<CallKey, ControlledContext> contexts = new LinkedHashMap<>();
-    private final Map<FlinkUdfInstance, List<AuronUDFWrapperContext>> delegates = new LinkedHashMap<>();
+    private final Map<FlinkUdfInstance, List<FlinkRowLevelUdfContext>> delegates = new LinkedHashMap<>();
     private final List<FlinkUdfToken> registeredTokens = new ArrayList<>();
-    private boolean openAttempted;
+    private int nextContextId = 0;
 
     public UUID getOwner() {
         return owner;
@@ -67,10 +68,14 @@ public final class FlinkUdfLifecycle implements AutoCloseable {
             ClassLoader classLoader,
             ContextFactory factory)
             throws Exception {
-        if (openAttempted || state.get() != State.OPENING) {
-            throw new IllegalStateException("UDF 生命周期不允许重复 open 或停止后 open");
+        State initialState = state.get();
+        boolean firstOpen = initialState == State.OPENING;
+        if (!firstOpen && initialState != State.RUNNING) {
+            throw new IllegalStateException("UDF 生命周期不允许在 " + initialState + " 状态下继续绑定 UDF");
         }
-        openAttempted = true;
+
+        List<FlinkUdfInstance> newInstances = new ArrayList<>();
+        List<ControlledContext> newContexts = new ArrayList<>();
         try {
             Objects.requireNonNull(payloads, "payloads");
             if (!payloads.isEmpty()) {
@@ -104,62 +109,94 @@ public final class FlinkUdfLifecycle implements AutoCloseable {
                     selected.put(key, payload);
                 }
             }
+
             List<FlinkUdfPayload> ordered = new ArrayList<>(selected.values());
             ordered.sort(Comparator.comparingLong(payload -> firstRegistrations.get(new InstanceKey(payload))));
             IdentityHashMap<ScalarFunction, Boolean> functions = new IdentityHashMap<>();
             for (FlinkUdfPayload payload : ordered) {
-                checkOpening();
-                ScalarFunction function =
-                        Objects.requireNonNull(factory.resolveFunction(payload, classLoader), "resolvedFunction");
-                if (functions.put(function, Boolean.TRUE) != null) {
-                    throw new IllegalArgumentException("不同 scope 或字段不能共享同一个 ScalarFunction 对象");
+                if (isStopping()) {
+                    throw new IllegalStateException("UDF 生命周期在绑定 UDF 实例期间已停止");
                 }
-                FlinkUdfInstance instance = new FlinkUdfInstance(
-                        payload.getScope(),
-                        payload.getFieldName(),
-                        function,
-                        this::isStopping,
-                        () -> state.get() == State.RUNNING);
-                instances.put(new InstanceKey(payload), instance);
-                delegates.put(instance, new ArrayList<>());
+                InstanceKey instanceKey = new InstanceKey(payload);
+                if (!instances.containsKey(instanceKey)) {
+                    ScalarFunction function =
+                            Objects.requireNonNull(factory.resolveFunction(payload, classLoader), "resolvedFunction");
+                    if (functions.put(function, Boolean.TRUE) != null) {
+                        throw new IllegalArgumentException("不同 scope 或字段不能共享同一个 ScalarFunction 对象");
+                    }
+                    FlinkUdfInstance instance = new FlinkUdfInstance(
+                            payload.getScope(),
+                            payload.getFieldName(),
+                            function,
+                            this::isStopping,
+                            () -> state.get() == State.RUNNING);
+                    instances.put(instanceKey, instance);
+                    delegates.put(instance, new ArrayList<>());
+                    newInstances.add(instance);
+                }
             }
+
             List<FlinkUdfToken> result = new ArrayList<>(payloads.size());
-            IdentityHashMap<AuronUDFWrapperContext, Boolean> allocatedContexts = new IdentityHashMap<>();
+            IdentityHashMap<FlinkRowLevelUdfContext, Boolean> allocatedContexts = new IdentityHashMap<>();
             for (FlinkUdfPayload payload : payloads) {
-                checkOpening();
+                if (isStopping()) {
+                    throw new IllegalStateException("UDF 生命周期在绑定 UDF context 期间已停止");
+                }
                 CallKey key = new CallKey(payload);
                 ControlledContext context = contexts.get(key);
                 if (context == null) {
                     FlinkUdfInstance instance = instances.get(new InstanceKey(payload));
-                    AuronUDFWrapperContext delegate =
+                    FlinkRowLevelUdfContext delegate =
                             Objects.requireNonNull(factory.createContext(payload, instance), "createdContext");
                     if (allocatedContexts.put(delegate, Boolean.TRUE) != null) {
                         throw new IllegalArgumentException("不同调用适配器不能复用同一个 context 对象");
                     }
                     delegates.get(instance).add(delegate);
-                    context =
-                            new ControlledContext(this, instance, delegate, new FlinkUdfToken(owner, contexts.size()));
+                    context = new ControlledContext(
+                            false, this, instance, delegate, new FlinkUdfToken(owner, nextContextId++));
                     contexts.put(key, context);
+                    newContexts.add(context);
                 }
                 result.add(context.token);
             }
-            for (FlinkUdfInstance instance : instances.values()) {
-                checkOpening();
+
+            for (FlinkUdfInstance instance : newInstances) {
+                if (isStopping()) {
+                    throw new IllegalStateException("UDF 生命周期在打开 UDF 实例期间已停止");
+                }
                 instance.open(functionContext);
             }
-            for (ControlledContext context : contexts.values()) {
-                checkOpening();
+
+            for (ControlledContext context : newContexts) {
+                if (isStopping()) {
+                    throw new IllegalStateException("UDF 生命周期在注册 UDF context 期间已停止");
+                }
                 UdfRegistry.register(context.token, context);
                 registeredTokens.add(context.token);
             }
-            if (!state.compareAndSet(State.OPENING, State.RUNNING)) {
+
+            if (firstOpen && !state.compareAndSet(State.OPENING, State.RUNNING)) {
                 throw new IllegalStateException("UDF 初始化期间已停止");
             }
+
             return Collections.unmodifiableList(result);
         } catch (Throwable failure) {
             stop();
             throw propagate(cleanup(failure));
         }
+    }
+
+    public FlinkUdfToken bind(FlinkRowLevelUdfContext context) {
+        if (state.get() != State.RUNNING) {
+            throw new IllegalStateException("UDF 生命周期不允许在非RUNNING状态下调用bind");
+        }
+        FlinkUdfToken token = new FlinkUdfToken(owner, nextContextId++);
+        ControlledContext controlled = new ControlledContext(true, this, null, context, token);
+
+        UdfRegistry.register(token, controlled);
+        registeredTokens.add(token);
+
+        return token;
     }
 
     /**
@@ -215,12 +252,6 @@ public final class FlinkUdfLifecycle implements AutoCloseable {
         return current == State.STOPPING || current == State.CLOSED;
     }
 
-    private void checkOpening() {
-        if (state.get() != State.OPENING) {
-            throw new IllegalStateException("UDF 初始化期间已停止");
-        }
-    }
-
     static Throwable aggregate(Throwable failure, Throwable error) {
         if (failure == null) {
             return error;
@@ -241,21 +272,31 @@ public final class FlinkUdfLifecycle implements AutoCloseable {
         return new RuntimeException(failure);
     }
 
-    static final class ControlledContext implements AuronUDFWrapperContext {
+    static final class ControlledContext implements FlinkRowLevelUdfContext {
         private final FlinkUdfLifecycle lifecycle;
-        private final FlinkUdfInstance instance;
-        private final AuronUDFWrapperContext delegate;
+        private final FlinkRowLevelUdfContext delegate;
         private final FlinkUdfToken token;
+        private final @Nullable FlinkUdfInstance instance; // 线程安全的udf实例
+        private final @Nullable Object groupGate; // 用于保护MergedUDFWrapperContext的锁
+        private final boolean isGroup;
 
         private ControlledContext(
+                boolean isGroup,
                 FlinkUdfLifecycle lifecycle,
                 FlinkUdfInstance instance,
-                AuronUDFWrapperContext delegate,
+                FlinkRowLevelUdfContext delegate,
                 FlinkUdfToken token) {
             this.lifecycle = lifecycle;
-            this.instance = instance;
             this.delegate = delegate;
             this.token = token;
+            this.isGroup = isGroup;
+            if (isGroup) {
+                this.instance = null;
+                this.groupGate = new Object();
+            } else {
+                this.instance = Objects.requireNonNull(instance);
+                this.groupGate = null;
+            }
         }
 
         void checkRunning() {
@@ -272,10 +313,46 @@ public final class FlinkUdfLifecycle implements AutoCloseable {
         @Override
         public void eval(long inputPtr, long outputPtr) {
             checkRunning();
-            instance.eval(() -> {
-                checkRunning();
-                delegate.eval(inputPtr, outputPtr);
-            });
+
+            if (isGroup) {
+                synchronized (groupGate) {
+                    checkRunning();
+                    delegate.eval(inputPtr, outputPtr);
+                }
+            } else {
+                instance.eval(() -> {
+                    checkRunning();
+                    delegate.eval(inputPtr, outputPtr);
+                });
+            }
+        }
+
+        @Override
+        public Object evalValue(RowData input) {
+            checkRunning();
+
+            if (isGroup) {
+                synchronized (groupGate) {
+                    checkRunning();
+                    return delegate.evalValue(input);
+                }
+            }
+
+            try {
+                return instance.invoke(ignored -> {
+                    checkRunning();
+                    return delegate.evalValue(input);
+                });
+            } catch (RuntimeException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new IllegalStateException("Flink UDF 行级求值失败", e);
+            }
+        }
+
+        @Override
+        public FlinkUdfBoundaryMetadata metadata() {
+            return delegate.metadata();
         }
 
         @Override

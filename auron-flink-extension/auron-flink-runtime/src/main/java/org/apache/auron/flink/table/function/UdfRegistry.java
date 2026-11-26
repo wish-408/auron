@@ -18,18 +18,17 @@ package org.apache.auron.flink.table.function;
 
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
-import org.apache.auron.functions.AuronUDFWrapperContext;
 
 public final class UdfRegistry {
-    private static final ConcurrentHashMap<String, AuronUDFWrapperContext> CONTEXTS = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, FlinkRowLevelUdfContext> CONTEXTS = new ConcurrentHashMap<>();
 
     private UdfRegistry() {}
 
-    public static void register(FlinkUdfToken token, AuronUDFWrapperContext context) {
+    public static void register(FlinkUdfToken token, FlinkRowLevelUdfContext context) {
         register(Objects.requireNonNull(token, "token").registryKey(), context);
     }
 
-    public static void register(String key, AuronUDFWrapperContext context) {
+    public static void register(String key, FlinkRowLevelUdfContext context) {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(context, "context");
         if (CONTEXTS.putIfAbsent(key, context) != null) {
@@ -37,12 +36,12 @@ public final class UdfRegistry {
         }
     }
 
-    public static AuronUDFWrapperContext lookup(FlinkUdfToken token) {
+    public static FlinkRowLevelUdfContext lookup(FlinkUdfToken token) {
         return lookup(Objects.requireNonNull(token, "token").registryKey());
     }
 
-    public static AuronUDFWrapperContext lookup(String key) {
-        AuronUDFWrapperContext context = CONTEXTS.get(Objects.requireNonNull(key, "key"));
+    public static FlinkRowLevelUdfContext lookup(String key) {
+        FlinkRowLevelUdfContext context = CONTEXTS.get(Objects.requireNonNull(key, "key"));
         if (context == null) {
             throw new IllegalStateException("UDF token 未注册或已移除: " + key);
         }

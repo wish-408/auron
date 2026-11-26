@@ -29,11 +29,13 @@ import org.apache.auron.flink.arrow.FlinkArrowReader;
 import org.apache.auron.flink.arrow.FlinkArrowUtils;
 import org.apache.auron.flink.configuration.FlinkAuronConfiguration;
 import org.apache.auron.flink.runtime.operator.AuronPlanTreeRewriter;
+import org.apache.auron.flink.runtime.operator.AuronPlanTreeRewriter.FlinkUdfGroup;
 import org.apache.auron.flink.runtime.operator.FlinkAuronFunction;
 import org.apache.auron.flink.table.data.AuronColumnarRowData;
 import org.apache.auron.flink.table.function.FlinkUdfLifecycle;
-import org.apache.auron.flink.table.function.FlinkUdfPayload;
+// import org.apache.auron.flink.table.function.FlinkUdfPayload;
 import org.apache.auron.flink.table.function.FlinkUdfToken;
+import org.apache.auron.flink.table.function.MergedUDFWrapperContext;
 import org.apache.auron.flink.utils.SchemaConverters;
 import org.apache.auron.jni.AuronAdaptor;
 import org.apache.auron.jni.AuronCallNativeWrapper;
@@ -537,16 +539,37 @@ public class AuronKafkaSourceFunction extends RichParallelSourceFunction<RowData
     }
 
     private void bindUdfLifecycle() throws Exception {
-        List<FlinkUdfPayload> payloads = AuronPlanTreeRewriter.collectUdfPayloads(physicalPlanNode);
-        if (payloads.isEmpty()) {
+        // List<FlinkUdfPayload> payloads = AuronPlanTreeRewriter.collectUdfPayloads(physicalPlanNode);
+        // if (payloads.isEmpty()) {
+        //     return;
+        // }
+        // this.udfLifecycle = new FlinkUdfLifecycle();
+        // List<FlinkUdfToken> tokens = udfLifecycle.openAndBind(
+        //         payloads,
+        //         new FunctionContext(getRuntimeContext()),
+        //         getRuntimeContext().getUserCodeClassLoader());
+        // this.physicalPlanNode = AuronPlanTreeRewriter.rewriteUdfTokens(physicalPlanNode, tokens);
+
+        List<FlinkUdfGroup> groups = AuronPlanTreeRewriter.collectUdfPayloadGroups(physicalPlanNode);
+        if (groups.isEmpty()) {
             return;
         }
+
         this.udfLifecycle = new FlinkUdfLifecycle();
-        List<FlinkUdfToken> tokens = udfLifecycle.openAndBind(
-                payloads,
-                new FunctionContext(getRuntimeContext()),
-                getRuntimeContext().getUserCodeClassLoader());
-        this.physicalPlanNode = AuronPlanTreeRewriter.rewriteUdfTokens(physicalPlanNode, tokens);
+
+        for (FlinkUdfGroup group : groups) {
+            List<FlinkUdfToken> tokens = udfLifecycle.openAndBind(
+                    group.payloads(),
+                    new FunctionContext(getRuntimeContext()),
+                    getRuntimeContext().getUserCodeClassLoader());
+
+            MergedUDFWrapperContext context = new MergedUDFWrapperContext(tokens);
+
+            FlinkUdfToken groupToken = udfLifecycle.bind(context);
+            group.bindToken(groupToken);
+
+            physicalPlanNode = AuronPlanTreeRewriter.rewriteGroupedUdfTokens(physicalPlanNode, group);
+        }
     }
 
     private void stopUdfLifecycle() {

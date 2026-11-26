@@ -28,7 +28,6 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.auron.flink.arrow.FlinkArrowReader;
 import org.apache.auron.flink.arrow.FlinkArrowUtils;
 import org.apache.auron.flink.arrow.FlinkArrowWriter;
-import org.apache.auron.functions.AuronUDFWrapperContext;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.functions.ScalarFunction;
@@ -50,7 +49,7 @@ import org.apache.flink.table.types.logical.VarCharType;
  *   <li>调用门控（RUNNING 检查、实例互斥、迟到 eval 拒绝）由生命周期门面承担，本类不做重复状态机。
  * </ul>
  */
-public final class FlinkUDFWrapperContext implements AuronUDFWrapperContext {
+public final class FlinkUDFWrapperContext implements FlinkRowLevelUdfContext {
 
     private final FlinkUdfInstance instance;
     private final Schema paramsSchema;
@@ -58,9 +57,6 @@ public final class FlinkUDFWrapperContext implements AuronUDFWrapperContext {
     private final RowType paramRowType;
     private final RowType outputRowType;
     private final FlinkUDFHelper helper;
-    private final List<Boolean> argumentLiterals;
-    private final List<Boolean> argumentNulls;
-    private final List<Object> argumentValues;
     private final DictionaryProvider dictionaryProvider = new DictionaryProvider.MapDictionaryProvider();
     private double lastStringBytesPerRow;
 
@@ -80,9 +76,6 @@ public final class FlinkUDFWrapperContext implements AuronUDFWrapperContext {
         this.paramRowType = Objects.requireNonNull(paramRowType, "paramRowType");
         this.outputRowType = Objects.requireNonNull(outputRowType, "outputRowType");
         this.helper = Objects.requireNonNull(helper, "helper");
-        this.argumentLiterals = Objects.requireNonNull(argumentLiterals, "argumentLiterals");
-        this.argumentNulls = Objects.requireNonNull(argumentNulls, "argumentNulls");
-        this.argumentValues = Objects.requireNonNull(argumentValues, "argumentValues");
     }
 
     /**
@@ -124,6 +117,12 @@ public final class FlinkUDFWrapperContext implements AuronUDFWrapperContext {
         }
     }
 
+    @Override
+    public Object evalValue(RowData input) {
+        ScalarFunction function = sharedFunction();
+        return helper.evalUDF(function, input);
+    }
+
     private ScalarFunction sharedFunction() {
         try {
             return instance.invoke(function -> function);
@@ -162,5 +161,10 @@ public final class FlinkUDFWrapperContext implements AuronUDFWrapperContext {
         return outputRowType.getFieldCount() == 1
                 && (outputRowType.getTypeAt(0) instanceof VarCharType
                         || outputRowType.getTypeAt(0) instanceof CharType);
+    }
+
+    @Override
+    public FlinkUdfBoundaryMetadata metadata() {
+        return new FlinkUdfBoundaryMetadata(paramsSchema, outputSchema, paramRowType, outputRowType);
     }
 }

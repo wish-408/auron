@@ -19,9 +19,11 @@ package org.apache.auron.flink.runtime.operator;
 import com.google.protobuf.ByteString;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.Optional;
 import java.util.function.UnaryOperator;
 import org.apache.auron.flink.table.function.FlinkUdfPayload;
 import org.apache.auron.flink.table.function.FlinkUdfToken;
@@ -51,6 +53,44 @@ import org.apache.auron.protobuf.ProjectionExecNode;
  * leaf rewrite above.
  */
 public final class AuronPlanTreeRewriter {
+    public static final class FlinkUdfGroup {
+        private final String groupId;
+        private final List<FlinkUdfPayload> payloads;
+        private final List<PhysicalSparkUDFWrapperExprNode> wrappers;
+        private FlinkUdfToken token;
+
+        public FlinkUdfGroup(String groupId) {
+            this.groupId = groupId;
+            this.payloads = new ArrayList<FlinkUdfPayload>();
+            this.wrappers = new ArrayList<PhysicalSparkUDFWrapperExprNode>();
+            this.token = null;
+        }
+
+        public String groupId() {
+            return this.groupId;
+        }
+
+        public void bindToken(FlinkUdfToken token) {
+            this.token = token;
+        }
+
+        public Optional<FlinkUdfToken> token() {
+            return Optional.ofNullable(this.token);
+        }
+
+        public List<FlinkUdfPayload> payloads() {
+            return this.payloads;
+        }
+
+        public List<PhysicalSparkUDFWrapperExprNode> wrappers() {
+            return this.wrappers;
+        }
+
+        void add(PhysicalSparkUDFWrapperExprNode wrapper, FlinkUdfPayload payload) {
+            wrappers.add(wrapper);
+            payloads.add(payload);
+        }
+    }
 
     private AuronPlanTreeRewriter() {}
 
@@ -312,5 +352,59 @@ public final class AuronPlanTreeRewriter {
         return expr.toBuilder()
                 .setTryCast(expr.getTryCast().toBuilder().setExpr(child).build())
                 .build();
+    }
+
+    public static List<FlinkUdfGroup> collectUdfPayloadGroups(PhysicalPlanNode plan) {
+        List<FlinkUdfGroup> groups = new ArrayList<>();
+        IdentityHashMap<PhysicalSparkUDFWrapperExprNode, FlinkUdfGroup> groupByWrapper = new IdentityHashMap<>();
+
+        transformUdfWrappers(plan, wrapper -> {
+            FlinkUdfPayload payload = FlinkUdfPayload.decode(
+                    ByteBuffer.wrap(wrapper.getSerialized().toByteArray()));
+
+            if (wrapper.getParamsCount() == 1 && wrapper.getParams(0).hasSparkUdfWrapperExpr()) {
+                PhysicalSparkUDFWrapperExprNode child = wrapper.getParams(0).getSparkUdfWrapperExpr();
+
+                FlinkUdfGroup childGroup = groupByWrapper.get(child);
+                if (childGroup != null) {
+                    childGroup.add(wrapper, payload);
+                    groupByWrapper.put(wrapper, childGroup);
+                    return wrapper;
+                }
+            }
+
+            FlinkUdfGroup group = new FlinkUdfGroup(Long.toString(payload.getRegistrationOrder()));
+            group.add(wrapper, payload);
+            groups.add(group);
+            groupByWrapper.put(wrapper, group);
+
+            return wrapper;
+        });
+
+        return groups;
+    }
+
+    public static PhysicalPlanNode rewriteGroupedUdfTokens(PhysicalPlanNode plan, FlinkUdfGroup group) {
+        FlinkUdfToken token =
+                group.token().orElseThrow(() -> new IllegalStateException("UDF group 尚未绑定 token: " + group.groupId()));
+
+        PhysicalSparkUDFWrapperExprNode innermost = group.wrappers().get(0);
+        PhysicalSparkUDFWrapperExprNode outermost =
+                group.wrappers().get(group.wrappers().size() - 1);
+
+        return transformUdfWrappers(plan, wrapper -> {
+            if (!wrapper.equals(outermost)) {
+                return wrapper;
+            }
+
+            return wrapper.toBuilder()
+                    .setSerialized(ByteString.copyFrom(token.encode()))
+                    .setReturnType(outermost.getReturnType())
+                    .setReturnNullable(outermost.getReturnNullable())
+                    .clearParams()
+                    .addAllParams(innermost.getParamsList())
+                    .setExprString(outermost.getExprString())
+                    .build();
+        });
     }
 }

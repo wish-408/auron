@@ -25,7 +25,6 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.arrow.vector.types.pojo.Schema;
-import org.apache.auron.functions.AuronUDFWrapperContext;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.util.DataFormatConverters;
 import org.apache.flink.table.functions.ScalarFunction;
@@ -234,7 +233,7 @@ public final class FlinkUDFHelper {
         }
 
         @Override
-        public AuronUDFWrapperContext createContext(FlinkUdfPayload payload, FlinkUdfInstance instance)
+        public FlinkRowLevelUdfContext createContext(FlinkUdfPayload payload, FlinkUdfInstance instance)
                 throws Exception {
             ClassLoader classLoader =
                     instance.prepare(function -> function.getClass().getClassLoader());

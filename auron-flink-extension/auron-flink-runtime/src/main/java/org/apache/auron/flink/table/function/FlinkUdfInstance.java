@@ -19,7 +19,6 @@ package org.apache.auron.flink.table.function;
 import java.util.List;
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
-import org.apache.auron.functions.AuronUDFWrapperContext;
 import org.apache.flink.table.functions.FunctionContext;
 import org.apache.flink.table.functions.ScalarFunction;
 
@@ -88,12 +87,12 @@ public final class FlinkUdfInstance {
         call.run();
     }
 
-    synchronized Throwable close(List<AuronUDFWrapperContext> contexts, Throwable failure) {
+    synchronized Throwable close(List<FlinkRowLevelUdfContext> contexts, Throwable failure) {
         if (closed) {
             return failure;
         }
         closed = true;
-        for (AuronUDFWrapperContext context : contexts) {
+        for (FlinkRowLevelUdfContext context : contexts) {
             try {
                 context.close();
             } catch (Throwable error) {

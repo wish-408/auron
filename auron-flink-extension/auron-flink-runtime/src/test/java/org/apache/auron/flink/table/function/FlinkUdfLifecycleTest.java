@@ -30,8 +30,8 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
-import org.apache.auron.functions.AuronUDFWrapperContext;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.functions.FunctionContext;
 import org.apache.flink.table.functions.ScalarFunction;
 import org.junit.jupiter.api.Test;
@@ -59,11 +59,52 @@ class FlinkUdfLifecycleTest {
             UdfRegistry.lookup(tokens.get(0)).eval(0, 0);
             UdfRegistry.lookup(tokens.get(1)).eval(0, 0);
             assertEquals(2, factory.functions.get(0).calls.get());
-            assertThrows(IllegalStateException.class, () -> bind(lifecycle, factory, first));
+            List<FlinkUdfToken> rebound = bind(lifecycle, factory, first);
+            assertEquals(tokens.get(0), rebound.get(0));
+            assertEquals(2, factory.contexts.size());
+            assertEquals(1, factory.functions.get(0).opens);
         }
         assertEquals(1, factory.functions.get(0).closes);
         assertEquals(1, factory.contexts.get(0).closes);
         assertEquals(1, factory.contexts.get(1).closes);
+    }
+
+    @Test
+    void bindRejectsFreshLifecycleBeforeOpenAndBind() throws Exception {
+        FlinkUdfLifecycle lifecycle = new FlinkUdfLifecycle();
+        try {
+            assertThrows(IllegalStateException.class, () -> lifecycle.bind(new RecordingGroupContext()));
+            assertEquals(FlinkUdfLifecycle.State.OPENING, lifecycle.getState());
+        } finally {
+            lifecycle.close();
+        }
+    }
+
+    @Test
+    void bindRejectsClosedLifecycle() throws Exception {
+        FlinkUdfLifecycle lifecycle = new FlinkUdfLifecycle();
+        lifecycle.close();
+
+        assertThrows(IllegalStateException.class, () -> lifecycle.bind(new RecordingGroupContext()));
+    }
+
+    @Test
+    void bindAllocatesDistinctGroupTokenAfterChildTokensAndWrapsGroupContext() throws Exception {
+        RecordingFactory factory = new RecordingFactory();
+        FlinkUdfLifecycle lifecycle = new FlinkUdfLifecycle();
+        try {
+            List<FlinkUdfToken> childTokens = bind(lifecycle, factory, payload("s", 0, "F", 1));
+            RecordingGroupContext context = new RecordingGroupContext();
+
+            FlinkUdfToken groupToken = lifecycle.bind(context);
+
+            assertNotEquals(childTokens.get(0), groupToken);
+            assertEquals(1L, groupToken.getContextId());
+            UdfRegistry.lookup(groupToken).eval(0, 0);
+            assertEquals(1, context.evalCalls.get());
+        } finally {
+            lifecycle.close();
+        }
     }
 
     @Test
@@ -91,11 +132,8 @@ class FlinkUdfLifecycleTest {
             }
 
             @Override
-            public AuronUDFWrapperContext createContext(FlinkUdfPayload payload, FlinkUdfInstance instance) {
-                return new AuronUDFWrapperContext() {
-                    @Override
-                    public void eval(long inputPtr, long outputPtr) {}
-                };
+            public FlinkRowLevelUdfContext createContext(FlinkUdfPayload payload, FlinkUdfInstance instance) {
+                return new TestContext(instance, null);
             }
         };
         try (FlinkUdfLifecycle lifecycle = new FlinkUdfLifecycle()) {
@@ -155,8 +193,8 @@ class FlinkUdfLifecycleTest {
         FlinkUdfLifecycle lifecycle = new FlinkUdfLifecycle();
         try {
             List<FlinkUdfToken> tokens = bind(lifecycle, factory, payload("s", 0, "F", 1), payload("s", 1, "F", 2));
-            AuronUDFWrapperContext first = UdfRegistry.lookup(tokens.get(0));
-            AuronUDFWrapperContext second = UdfRegistry.lookup(tokens.get(1));
+            FlinkRowLevelUdfContext first = UdfRegistry.lookup(tokens.get(0));
+            FlinkRowLevelUdfContext second = UdfRegistry.lookup(tokens.get(1));
             Future<?> running = executor.submit(() -> first.eval(0, 0));
             await(entered);
             CountDownLatch attempted = new CountDownLatch(1);
@@ -190,7 +228,7 @@ class FlinkUdfLifecycleTest {
         try {
             FlinkUdfToken token =
                     bind(lifecycle, factory, payload("s", 0, "F", 1)).get(0);
-            AuronUDFWrapperContext retained = UdfRegistry.lookup(token);
+            FlinkRowLevelUdfContext retained = UdfRegistry.lookup(token);
             Future<?> evaluation = executor.submit(() -> retained.eval(0, 0));
             await(entered);
             executor.submit(lifecycle::stop).get(5, TimeUnit.SECONDS);
@@ -347,7 +385,7 @@ class FlinkUdfLifecycleTest {
         FlinkUdfLifecycle lifecycle = new FlinkUdfLifecycle();
         FlinkUdfToken first = new FlinkUdfToken(lifecycle.getOwner(), 0);
         FlinkUdfToken collision = new FlinkUdfToken(lifecycle.getOwner(), 1);
-        AuronUDFWrapperContext occupied = (input, output) -> {};
+        FlinkRowLevelUdfContext occupied = new TestContext(null, null);
         UdfRegistry.register(collision, occupied);
         try {
             assertThrows(
@@ -367,10 +405,10 @@ class FlinkUdfLifecycleTest {
     @Test
     void registryRejectsDuplicatesAndLookupDoesNotRemove() {
         FlinkUdfToken token = new FlinkUdfToken(java.util.UUID.randomUUID(), 0);
-        AuronUDFWrapperContext context = (input, output) -> {};
+        FlinkRowLevelUdfContext context = new TestContext(null, null);
         UdfRegistry.register(token, context);
         try {
-            assertThrows(IllegalStateException.class, () -> UdfRegistry.register(token, (input, output) -> {}));
+            assertThrows(IllegalStateException.class, () -> UdfRegistry.register(token, new TestContext(null, null)));
             assertSame(context, UdfRegistry.lookup(token));
             assertSame(context, UdfRegistry.lookup(token.registryKey()));
         } finally {
@@ -527,7 +565,7 @@ class FlinkUdfLifecycleTest {
         }
     }
 
-    private static final class TestContext implements AuronUDFWrapperContext {
+    private static final class TestContext implements FlinkRowLevelUdfContext {
         private final FlinkUdfInstance instance;
         private final RuntimeException closeFailure;
         private int closes;
@@ -549,11 +587,41 @@ class FlinkUdfLifecycleTest {
         }
 
         @Override
+        public Object evalValue(RowData input) {
+            return null;
+        }
+
+        @Override
+        public FlinkUdfBoundaryMetadata metadata() {
+            return new FlinkUdfBoundaryMetadata(null, null, null, null);
+        }
+
+        @Override
         public void close() {
             closes++;
             if (closeFailure != null) {
                 throw closeFailure;
             }
+        }
+    }
+
+    private static final class RecordingGroupContext implements FlinkRowLevelUdfContext {
+        private final AtomicInteger evalCalls = new AtomicInteger();
+
+        @Override
+        public void eval(long inputPtr, long outputPtr) {
+            evalCalls.incrementAndGet();
+        }
+
+        @Override
+        public Object evalValue(RowData input) {
+            evalCalls.incrementAndGet();
+            return null;
+        }
+
+        @Override
+        public FlinkUdfBoundaryMetadata metadata() {
+            return new FlinkUdfBoundaryMetadata(null, null, null, null);
         }
     }
 
@@ -593,7 +661,7 @@ class FlinkUdfLifecycleTest {
         }
 
         @Override
-        public AuronUDFWrapperContext createContext(FlinkUdfPayload payload, FlinkUdfInstance instance)
+        public FlinkRowLevelUdfContext createContext(FlinkUdfPayload payload, FlinkUdfInstance instance)
                 throws Exception {
             if (contexts.size() == failContextAt) {
                 throw factoryFailure;
